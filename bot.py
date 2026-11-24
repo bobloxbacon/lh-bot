@@ -500,7 +500,7 @@ def build_premium_embed(user_id: int) -> discord.Embed:
 
 class HelpView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
 
     @discord.ui.button(
         label="Free Commands",
