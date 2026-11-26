@@ -19,6 +19,7 @@ import threading
 import asyncio
 import os
 import sys
+from typing import Optional
 
 # ── selfbot runs on discord.py-self which conflicts with discord.py
 # ── we import them in separate modules to avoid namespace collision
