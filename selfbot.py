@@ -1,6 +1,5 @@
 # language: Python 3.13  |  file: selfbot.py  |  runtime: discord.py-self 2.x
 # deps: discord.py-self — pip install discord.py-self
-#       aiohttp         — pip install aiohttp  (bundled with discord.py-self)
 #
 # ⚠️  RUNS ON A USER TOKEN — throwaway account only, never your main.
 #     Discord ToS violation — account may be terminated if detected.
@@ -14,20 +13,12 @@
 #   python selfbot.py
 #   Commands are typed in any Discord channel the account is in (DMs work too).
 #   Prefix: >>
-#
-# COMMANDS:
-#   >>spy            — list all servers the account is in
-#   >>members <id>   — dump member list of a server
-#   >>massdm <id> <msg>  — DM all humans in a server
-#   >>phish <id>     — DM all humans in a server with phish link
-#   >>spam <id> <ch_id> <count> <msg>  — spam a channel
-#   >>join <invite>  — join a server via invite code
-#   >>leave <id>     — leave a server
-#   >>scrape <id>    — scrape server info (roles, channels, member count)
-#   >>status <text>  — set custom status
-#   >>purge <count>  — delete your own last N messages in this channel
-#   >>ping           — latency check
-#   >>help           — command list
+
+# ── force discord.py-self import — clears any cached discord.py ──
+import sys
+for _key in list(sys.modules.keys()):
+    if _key == "discord" or _key.startswith("discord."):
+        del sys.modules[_key]
 
 import discord
 import asyncio

