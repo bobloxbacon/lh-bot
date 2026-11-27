@@ -90,9 +90,12 @@ def _run_selfbot():
     import subprocess
     env = os.environ.copy()
     print("[SB] Launching selfbot subprocess...")
+    # find selfbot.py next to main.py regardless of cwd
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _sb_path = os.path.join(_here, "selfbot.py")
     try:
         proc = subprocess.Popen(
-            [sys.executable, "selfbot.py"],
+            [sys.executable, _sb_path],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
