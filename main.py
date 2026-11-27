@@ -19,6 +19,7 @@ import threading
 import asyncio
 import os
 import sys
+from typing import Optional
 
 # ── selfbot runs on discord.py-self which conflicts with discord.py
 # ── we import them in separate modules to avoid namespace collision
@@ -667,7 +668,7 @@ async def token_info(interaction: discord.Interaction, token: str):
 #  SOCIAL ENGINEERING
 # ══════════════════════════════════════════════════════════════
 
-from typing import Optional, Optional as Opt
+from typing import Optional as Opt
 
 @bot.command(name="impersonate")
 async def impersonate(ctx, user: Opt[discord.Member] = None, *, message: str = None):
