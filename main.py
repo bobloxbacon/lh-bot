@@ -667,7 +667,7 @@ async def token_info(interaction: discord.Interaction, token: str):
 #  SOCIAL ENGINEERING
 # ══════════════════════════════════════════════════════════════
 
-from typing import Optional as Opt
+from typing import Optional, Optional as Opt
 
 @bot.command(name="impersonate")
 async def impersonate(ctx, user: Opt[discord.Member] = None, *, message: str = None):
