@@ -14,30 +14,49 @@
 #   Commands are typed in any Discord channel the account is in (DMs work too).
 #   Prefix: >>
 
-# ── force discord.py-self — uninstall discord.py first if present ──
+# ── force discord.py-self — nuclear import fix ──
 import sys
 import subprocess
+import importlib
+import importlib.util
 
-# uninstall discord.py (not discord.py-self) if it's installed
+# step 1: uninstall discord.py (keep discord.py-self)
 subprocess.run(
     [sys.executable, "-m", "pip", "uninstall", "-y", "discord.py"],
     capture_output=True
 )
 
-# clear any cached discord imports
+# step 2: reinstall discord.py-self fresh
+result = subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--force-reinstall", "discord.py-self"],
+    capture_output=True, text=True
+)
+print("[SB] pip discord.py-self:", result.returncode, result.stderr[-200:] if result.stderr else "ok")
+
+# step 3: clear ALL discord from sys.modules
 for _key in list(sys.modules.keys()):
     if _key == "discord" or _key.startswith("discord."):
         del sys.modules[_key]
 
+# step 4: find discord.py-self's actual path and load it
+import site
+import os
+_discord_path = None
+for _sp in site.getsitepackages():
+    _p = os.path.join(_sp, "discord", "__init__.py")
+    if os.path.exists(_p):
+        _discord_path = _p
+        break
+
+print(f"[SB] Loading discord from: {_discord_path}")
+
 import discord
 import asyncio
-import os
 import time
 
-# confirm we have the right library
-_self_flag = getattr(discord, "self_bot_allowed", None)
-_ver = getattr(discord, "__version__", "unknown")
-print(f"[SB] discord lib: {discord.__file__} | version: {_ver} | self_bot_allowed: {_self_flag}")
+print(f"[SB] discord.__file__: {getattr(discord, '__file__', 'NONE')}")
+print(f"[SB] has Client: {hasattr(discord, 'Client')}")
+print(f"[SB] has self_bot: {hasattr(discord, 'self_bot_allowed')}")
 
 # ── config ────────────────────────────────────────────────────
 # Set SELF_TOKEN in environment or paste directly (env preferred)
