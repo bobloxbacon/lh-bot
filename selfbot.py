@@ -14,8 +14,17 @@
 #   Commands are typed in any Discord channel the account is in (DMs work too).
 #   Prefix: >>
 
-# ── force discord.py-self import — clears any cached discord.py ──
+# ── force discord.py-self — uninstall discord.py first if present ──
 import sys
+import subprocess
+
+# uninstall discord.py (not discord.py-self) if it's installed
+subprocess.run(
+    [sys.executable, "-m", "pip", "uninstall", "-y", "discord.py"],
+    capture_output=True
+)
+
+# clear any cached discord imports
 for _key in list(sys.modules.keys()):
     if _key == "discord" or _key.startswith("discord."):
         del sys.modules[_key]
@@ -24,6 +33,11 @@ import discord
 import asyncio
 import os
 import time
+
+# confirm we have the right library
+_self_flag = getattr(discord, "self_bot_allowed", None)
+_ver = getattr(discord, "__version__", "unknown")
+print(f"[SB] discord lib: {discord.__file__} | version: {_ver} | self_bot_allowed: {_self_flag}")
 
 # ── config ────────────────────────────────────────────────────
 # Set SELF_TOKEN in environment or paste directly (env preferred)
