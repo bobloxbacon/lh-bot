@@ -52,10 +52,7 @@ SPAM_DELAY   = 0.8   # seconds between spam messages
 JOIN_DELAY   = 2.0   # seconds after joining before doing anything
 
 # ── client ────────────────────────────────────────────────────
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-client = discord.Client(intents=intents)
+client = discord.Client()
 
 
 # ══════════════════════════════════════════════════════════════
