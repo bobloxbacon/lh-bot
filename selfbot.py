@@ -89,12 +89,16 @@ async def reply(message: discord.Message, text: str):
 
 async def report_to_self(text: str):
     """DM yourself a report."""
-    if OWNER_ID:
-        try:
-            owner = await client.fetch_user(OWNER_ID)
-            await owner.send(text)
-        except Exception:
-            pass
+    if not OWNER_ID:
+        print("[SB] OWNER_ID not set — skipping DM report")
+        return
+    try:
+        owner = await client.fetch_user(OWNER_ID)
+        dm = await owner.create_dm()
+        await dm.send(text)
+        print(f"[SB] DM report sent to {owner}")
+    except Exception as e:
+        print(f"[SB] DM report FAILED: {e}")
 
 def fmt_member(m) -> str:
     joined = m.joined_at.strftime("%Y-%m-%d") if m.joined_at else "unknown"
